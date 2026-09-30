@@ -16,7 +16,7 @@ import struct
 import threading
 import time
 
-from collab_bridge import CONTROLS, NET_HELLO, NET_PING, NET_PONG, NET_VALUE
+from collab_bridge import CONTROLS, NET_HELLO, NET_PING, NET_PONG, NET_VALUE, PING_FMT, PONG_FMT
 
 CROSSFADER = CONTROLS.index(("[Master]", "crossfader"))
 
@@ -48,9 +48,10 @@ def main():
                 _, _, seq, idx, value = struct.unpack("!BIIBf", data)
                 name = ",".join(CONTROLS[idx]) if idx < len(CONTROLS) else f"idx {idx}"
                 print(f"  from Mixxx: {name} = {value:.4f}  (seq {seq})")
-            elif kind == NET_PING and len(data) == struct.calcsize("!BId"):
-                _, _, t = struct.unpack("!BId", data)
-                sock.sendto(struct.pack("!BId", NET_PONG, session, t), bridge_addr)
+            elif kind == NET_PING and len(data) == struct.calcsize(PING_FMT):
+                _, _, t0 = struct.unpack(PING_FMT, data)
+                now = time.perf_counter()
+                sock.sendto(struct.pack(PONG_FMT, NET_PONG, session, t0, now, now), bridge_addr)
 
     threading.Thread(target=recv_loop, daemon=True).start()
 
