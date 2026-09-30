@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<MixxxControllerPreset mixxxVersion="2.4.0+" schemaVersion="1">
+    <info>
+        <name>MixxxCollab Bridge</name>
+        <author>MixxxCollab</author>
+        <description>Proof-of-concept bridge that syncs mixer controls with a remote Mixxx via the collab_bridge.py companion app. Assign this to the loopMIDI port, not to your DJ controller.</description>
+    </info>
+    <controller id="MixxxCollab">
+        <scriptfiles>
+            <file functionprefix="MixxxCollab" filename="MixxxCollab.js"/>
+        </scriptfiles>
+        <controls>
+            <!-- Mixxx only passes incoming SysEx to the script's incomingData()
+                 when an input mapping exists for status 0xF0 / midino 0xFF. -->
+            <control>
+                <group>[Master]</group>
+                <key>MixxxCollab.incomingData</key>
+                <status>0xF0</status>
+                <midino>0xFF</midino>
+                <options>
+                    <script-binding/>
+                </options>
+            </control>
+        </controls>
+        <outputs/>
+    </controller>
+</MixxxControllerPreset>
