@@ -14,8 +14,9 @@ the leader pushes its full mixer state so both sides start out matching.
 """
 
 import argparse
-import os
 import collections
+import json
+import os
 import heapq
 import itertools
 import random
@@ -27,6 +28,8 @@ import threading
 import time
 
 import mido
+
+import nat
 
 DECKS = [f"[Channel{n}]" for n in range(1, 5)]   # must match MixxxCollab.decks
 
@@ -97,6 +100,9 @@ PONG_FMT = "!BIddd"
 HELLO_INTERVAL = 1.0
 PEER_TIMEOUT = 5.0
 RESEND_INTERVAL = 1.0     # resend our latest control values and paused positions this often
+PUNCH_INTERVAL = 0.25     # while not connected, say hello to every candidate address this often
+STUN_INTERVAL = 20.0      # refresh our public address (and keep the router's mapping open)
+SESSION_FILE = os.path.join(os.path.expanduser("~"), ".mixxxcollab", "session.json")
 
 # Clock sync (see "Clock sync" in the protocol doc). Starting values to tune.
 JOIN_BURST = 8            # pings sent when a peer (re)connects
@@ -586,10 +592,18 @@ class Bridge:
         self.deck_track = {}           # deck -> relative path our Mixxx has loaded (None: outside library)
         self.path_chunks = {}          # deck -> {chunk: bytes} while a path arrives from Mixxx
 
-        host, port = args.peer.rsplit(":", 1)
-        self.peer_addr = (socket.gethostbyname(host), int(port))
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("0.0.0.0", args.listen))
+        # Internet play: with a session secret every packet is signed, and the
+        # peer is whoever signs correctly, from whichever of its candidate
+        # addresses (public or LAN) gets through first. Without one (plain
+        # --peer on a LAN), only the given address is trusted.
+        self.secret = args.secret
+        self.candidates = list(args.candidates)
+        self.peer_addr = self.candidates[0] if self.candidates else None
+        self.public_addr = None
+        self.stun_txns = {}
+        self.upnp = None
 
         self.peer_session = None
         self.peer_last_seen = 0.0
@@ -611,17 +625,75 @@ class Bridge:
         print(f"MIDI: in='{in_name}' out='{out_name}'")
         self.send_to_mixxx([SYSEX_ID, TO_MIXXX, MSG_REPORT_TRACKS])
         self.send_following()
-        print(f"UDP:  listening on {args.listen}, peer {self.peer_addr[0]}:{self.peer_addr[1]}")
+        peer = ", ".join(f"{ip}:{port}" for ip, port in self.candidates) or "waiting for the partner"
+        print(f"UDP:  listening on {args.listen}, peer {peer}"
+              + ("  (signed: internet session)" if self.secret else ""))
         print(f"Role: {'LEADER' if self.leader else 'follower'}  session={self.session:08x}  "
               f"owns decks {', '.join(str(d + 1) for d in sorted(self.owned))}")
         if self.impair:
             print(f"TEST: impairing the network both ways: {args.impair}")
 
-    def send(self, packet):
-        if self.impair:
-            self.impair.schedule(lambda: self.sock.sendto(packet, self.peer_addr))
-        else:
-            self.sock.sendto(packet, self.peer_addr)
+    def send(self, packet, to=None):
+        """Send to the peer, or, before we've heard from it, to every
+        candidate address (which is also what opens a path through routers)."""
+        if self.secret:
+            packet = nat.sign(self.secret, packet)
+        targets = [to] if to else ([self.peer_addr] if self.connected() or not self.candidates
+                                   else list(self.candidates))
+        for addr in targets:
+            if addr is None:
+                continue
+            if self.impair:
+                self.impair.schedule(lambda a=addr: self._sendto(packet, a))
+            else:
+                self._sendto(packet, addr)
+
+    def _sendto(self, packet, addr):
+        try:
+            self.sock.sendto(packet, addr)
+        except OSError:
+            pass   # e.g. no route yet; punching keeps trying
+
+    # ---- reaching the peer across the internet ----
+    def stun(self):
+        for server in nat.stun_servers():
+            request, txn = nat.stun_request()
+            self.stun_txns[txn] = server
+            self._sendto(request, server)
+
+    def on_stun(self, data):
+        for txn in list(self.stun_txns):
+            addr = nat.parse_stun_response(data, txn)
+            if addr:
+                del self.stun_txns[txn]
+                if addr != self.public_addr:
+                    if self.public_addr:
+                        print(f"Our public address changed to {addr[0]}:{addr[1]}")
+                    self.public_addr = addr
+                return
+
+    def wait_for_public_address(self, timeout=3.0):
+        self.stun()
+        end = time.time() + timeout
+        while self.public_addr is None and time.time() < end:
+            time.sleep(0.05)
+        return self.public_addr
+
+    def add_candidates(self, addrs):
+        for addr in addrs:
+            if addr not in self.candidates:
+                self.candidates.append(addr)
+        if self.peer_addr is None and self.candidates:
+            self.peer_addr = self.candidates[0]
+
+    def save_session(self):
+        if not self.secret:
+            return
+        os.makedirs(os.path.dirname(SESSION_FILE), exist_ok=True)
+        known = ([self.peer_addr] if self.peer_addr else []) + self.candidates
+        unique = [list(a) for i, a in enumerate(known) if a and a not in known[:i]]
+        with open(SESSION_FILE, "w") as f:
+            json.dump({"secret": self.secret.hex(), "leader": self.leader, "peer": unique}, f)
 
     # ---- Mixxx -> network ----
     def on_midi(self, msg):
@@ -839,7 +911,21 @@ class Bridge:
                 data, addr = self.sock.recvfrom(2048)
             except ConnectionResetError:
                 continue  # Windows raises this for ICMP port-unreachable; ignore
-            if not data or addr != self.peer_addr:
+            if not data:
+                continue
+            if nat.is_stun(data):
+                self.on_stun(data)
+                continue
+            if self.secret:
+                data = nat.verify(self.secret, data)
+                if data is None:
+                    continue  # not signed with our session's secret
+                if addr != self.peer_addr:
+                    print(f"Peer reached at {addr[0]}:{addr[1]}")
+                    self.peer_addr = addr
+                    self.add_candidates([addr])
+                    self.save_session()
+            elif addr != self.peer_addr:
                 continue  # only the configured peer may drive this Mixxx
             if self.impair:
                 # Arrival time is taken when the impaired packet is delivered.
@@ -908,15 +994,24 @@ class Bridge:
 
     def hello_loop(self):
         was_connected = False
+        last_hello = last_stun = 0.0
         while True:
-            self.send(struct.pack("!BI", NET_HELLO, self.session))
+            now = time.time()
             connected = self.connected()
+            # Hello once a second when connected; four times a second to every
+            # candidate address while we're still trying to get through.
+            if now - last_hello >= (min(HELLO_INTERVAL, RESEND_INTERVAL) if connected else PUNCH_INTERVAL):
+                self.send(struct.pack("!BI", NET_HELLO, self.session))
+                if connected:
+                    self.resend()
+                last_hello = now
+            if self.secret and now - last_stun >= STUN_INTERVAL:
+                self.stun()
+                last_stun = now
             if was_connected and not connected:
-                print("Peer lost")
+                print("Peer lost; trying to reach it again")
             was_connected = connected
-            if connected:
-                self.resend()
-            time.sleep(min(HELLO_INTERVAL, RESEND_INTERVAL))
+            time.sleep(0.05)
 
     def resend(self):
         """Repeat what the peer might have missed: our latest control values,
@@ -992,8 +1087,9 @@ class Bridge:
                 print(f"Deck {sync.deck + 1} sync: error {sync.last_error * 1000:+.2f} ms, "
                       f"trim {sync.current_trim * 1e6:+.0f} ppm, seeks {sync.seeks}, {counts}")
 
-    def run(self):
-        threading.Thread(target=self.recv_loop, daemon=True).start()
+    def run(self, recv_started=False):
+        if not recv_started:
+            threading.Thread(target=self.recv_loop, daemon=True).start()
         threading.Thread(target=self.hello_loop, daemon=True).start()
         threading.Thread(target=self.clock_loop, daemon=True).start()
         print("Bridge running. Ctrl+C to stop.")
@@ -1003,6 +1099,8 @@ class Bridge:
         except KeyboardInterrupt:
             print("Stopping")
         finally:
+            if self.upnp:
+                nat.upnp_remove(self.upnp, self.args.listen)
             self.midi_in.close()
             self.midi_out.close()
 
@@ -1013,7 +1111,16 @@ def main():
     p.add_argument("--virtual", action="store_true",
                    help="create a virtual MIDI port named --midi (Linux/macOS) instead of using an existing one")
     p.add_argument("--listen", type=int, default=9000, help="local UDP port")
-    p.add_argument("--peer", help="peer host:port (required unless --list-ports)")
+    p.add_argument("--peer", help="peer host:port on the same network")
+    p.add_argument("--invite", action="store_true",
+                   help="leader: start an internet session and print an invite code for the partner")
+    p.add_argument("--join", metavar="CODE", help="follower: join the session in this invite code")
+    p.add_argument("--reply", metavar="CODE",
+                   help="leader: the partner's reply code (otherwise asked for, or read from "
+                        "~/.mixxxcollab/reply.txt)")
+    p.add_argument("--resume", action="store_true",
+                   help="reconnect the last internet session without new codes")
+    p.add_argument("--no-upnp", action="store_true", help="leader: don't ask the router to forward the port")
     p.add_argument("--leader", action="store_true", help="this side's state wins on connect")
     p.add_argument("--verbose", "-v", action="store_true", help="log every control change")
     p.add_argument("--list-ports", action="store_true", help="list MIDI ports and exit")
@@ -1040,10 +1147,76 @@ def main():
         print("Inputs: ", mido.get_input_names())
         print("Outputs:", mido.get_output_names())
         return
-    if not args.peer:
-        p.error("--peer is required")
+    args.secret, args.candidates = None, []
+    if args.peer:
+        host, port = args.peer.rsplit(":", 1)
+        args.candidates = [(socket.gethostbyname(host), int(port))]
+    if args.join:
+        try:
+            args.secret, invite_addrs = nat.read_invite(args.join)
+        except ValueError as e:
+            p.error(str(e))
+        args.candidates += invite_addrs
+        args.leader = False
+    elif args.invite:
+        args.secret = os.urandom(nat.SECRET_LEN)
+        args.leader = True
+    elif args.resume:
+        try:
+            with open(SESSION_FILE) as f:
+                saved = json.load(f)
+        except OSError:
+            p.error("no saved session to resume; start one with --invite / --join")
+        args.secret = bytes.fromhex(saved["secret"])
+        args.leader = saved["leader"]
+        args.candidates += [tuple(a) for a in saved["peer"]]
+    elif not args.peer:
+        p.error("give --peer for a local session, or --invite / --join / --resume for an internet one")
 
-    Bridge(args).run()
+    bridge = Bridge(args)
+    threading.Thread(target=bridge.recv_loop, daemon=True).start()
+    if args.secret:
+        public = bridge.wait_for_public_address()
+        lan = (nat.lan_address(), args.listen)
+        print(f"Public address: {public[0]}:{public[1]}" if public else
+              "Couldn't reach a STUN server; only the local network will work")
+        if args.invite:
+            if not args.no_upnp:
+                bridge.upnp, result = nat.upnp_forward(args.listen)
+                if bridge.upnp:
+                    print(f"Router forwards UDP {result[0]}:{result[1]} to us (UPnP)")
+                    public = result
+                else:
+                    print(f"No port forward: {result}. The reply code will be needed.")
+            print("\n  Invite code for your partner:\n\n    " + nat.make_invite(args.secret, public, lan) + "\n")
+            threading.Thread(target=wait_for_reply, args=(bridge, args.reply), daemon=True).start()
+        elif args.join:
+            print("\n  Send this reply code back to the leader:\n\n    "
+                  + nat.make_reply(args.secret, public, lan) + "\n")
+        bridge.save_session()
+    bridge.run(recv_started=True)
+
+
+def wait_for_reply(bridge, code):
+    """The leader learns the partner's addresses from the reply code. Often
+    not needed (the partner's packets get through first), so it's optional."""
+    path = os.path.join(os.path.dirname(SESSION_FILE), "reply.txt")
+    while not code:
+        if bridge.connected():
+            return
+        if os.path.exists(path):
+            with open(path) as f:
+                code = f.read().strip()
+            os.remove(path)
+        elif sys.stdin and sys.stdin.isatty():
+            code = input("  Paste the partner's reply code (or just wait if it connects): ").strip()
+        else:
+            time.sleep(1)
+    try:
+        bridge.add_candidates(nat.read_reply(bridge.secret, code))
+        print("Reply code accepted; reaching the partner...")
+    except ValueError as e:
+        print(f"Reply code not accepted: {e}")
 
 
 if __name__ == "__main__":

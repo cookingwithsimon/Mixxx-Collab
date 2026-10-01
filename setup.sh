@@ -26,6 +26,11 @@ else
     uv pip install --python "$venv/bin/python" --only-binary=:all: mido python-rtmidi
 fi
 
+# Optional: lets the leader ask the router to forward its port for internet sessions.
+"$venv/bin/python" -m pip install --quiet --disable-pip-version-check --only-binary=:all: miniupnpc 2>/dev/null ||
+    uv pip install --python "$venv/bin/python" --only-binary=:all: miniupnpc 2>/dev/null ||
+    echo "UPnP support not installed (optional)"
+
 bash sync.sh
 
 cat <<'EOF'

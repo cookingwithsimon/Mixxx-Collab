@@ -119,7 +119,8 @@ def make_bridge(sim, listen, peer, leader, impair, skew, drift=0.0):
     args = types.SimpleNamespace(
         leader=leader, verbose=False, test_clock_skew=skew, test_clock_drift=drift,
         clock_log=None, no_deck_sync=False, sync_log=None, impair=impair,
-        peer=f"127.0.0.1:{peer}", listen=listen, virtual=False, midi="sim", own_decks=None, library=None)
+        peer=f"127.0.0.1:{peer}", listen=listen, virtual=False, midi="sim", own_decks=None, library=None,
+        secret=None, candidates=[("127.0.0.1", peer)])
     mido.get_input_names = lambda: ["sim"]
     mido.get_output_names = lambda: ["sim"]
     holder = {}

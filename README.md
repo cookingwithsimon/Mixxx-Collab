@@ -27,6 +27,25 @@ Then, with exactly one side passing `--leader`:
 Both PCs must allow inbound UDP 9000. Rerun `sync.ps1` and restart Mixxx after
 changing the mapping files.
 
+## Internet sessions
+
+Between two homes, the leader starts a session and gets an invite code:
+
+    powershell -ExecutionPolicy Bypass -File run.ps1 --invite -v --library <music folder>
+
+The partner joins with it (Linux: `bash run.sh --join <code> ...`) and gets a reply code:
+
+    powershell -ExecutionPolicy Bypass -File run.ps1 --join <invite code> -v --library <music folder>
+
+Send the reply code back if the two don't connect within a few seconds; the
+leader pastes it when asked. Both bridges learn their public address from a
+public STUN server, the leader asks its router to forward the port (UPnP)
+where it can, and both send to each other's public and local addresses until
+one gets through. Every packet is signed with a secret from the invite code,
+so nobody else can drive your Mixxx. `--resume` reconnects the last session
+without new codes. Very strict routers (some mobile networks) may still need
+a relay, which isn't built yet.
+
 ## Linux
 
 There is no loopMIDI on Linux, so the bridge creates the virtual MIDI port itself
