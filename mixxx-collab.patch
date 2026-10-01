@@ -1,0 +1,106 @@
+diff --git a/src/controllers/scripting/legacy/controllerscriptinterfacelegacy.cpp b/src/controllers/scripting/legacy/controllerscriptinterfacelegacy.cpp
+index 3efe12d..7d0dd0e 100644
+--- a/src/controllers/scripting/legacy/controllerscriptinterfacelegacy.cpp
++++ b/src/controllers/scripting/legacy/controllerscriptinterfacelegacy.cpp
+@@ -4,7 +4,9 @@
+ #include "control/controlobjectscript.h"
+ #include "controllers/scripting/legacy/controllerscriptenginelegacy.h"
+ #include "controllers/scripting/legacy/scriptconnectionjsproxy.h"
++#include "mixer/playerinfo.h"
+ #include "mixer/playermanager.h"
++#include "track/track.h"
+ #include "moc_controllerscriptinterfacelegacy.cpp"
+ #include "util/fpclassify.h"
+ #include "util/make_const_iterator.h"
+@@ -475,6 +477,29 @@ void ControllerScriptInterfaceLegacy::trigger(const QString& group, const QStrin
+     coScript->emitValueChanged();
+ }
+ 
++void ControllerScriptInterfaceLegacy::loadTrackFromLocation(
++        const QString& group, const QString& location, bool play) {
++    PlayerManager* pPlayerManager = PlayerManager::instance();
++    if (!pPlayerManager) {
++        qWarning() << "loadTrackFromLocation: no player manager";
++        return;
++    }
++    // Scripts run in the controller thread; the player manager lives in the
++    // main thread. Using it as the context object drops the call if it is
++    // destroyed before the call runs.
++    QMetaObject::invokeMethod(
++            pPlayerManager,
++            [pPlayerManager, location, group, play]() {
++                pPlayerManager->slotLoadLocationToPlayer(location, group, play);
++            },
++            Qt::QueuedConnection);
++}
++
++QString ControllerScriptInterfaceLegacy::getTrackLocation(const QString& group) {
++    TrackPointer pTrack = PlayerInfo::instance().getTrackInfo(group);
++    return pTrack ? pTrack->getLocation() : QString();
++}
++
+ void ControllerScriptInterfaceLegacy::log(const QString& message) {
+     m_pScriptEngineLegacy->logOrThrowError(QStringLiteral(
+             "`engine.log` is deprecated. Use `console.log` instead!"));
+diff --git a/src/controllers/scripting/legacy/controllerscriptinterfacelegacy.h b/src/controllers/scripting/legacy/controllerscriptinterfacelegacy.h
+index 4d3e280..9c83d3b 100644
+--- a/src/controllers/scripting/legacy/controllerscriptinterfacelegacy.h
++++ b/src/controllers/scripting/legacy/controllerscriptinterfacelegacy.h
+@@ -47,6 +47,10 @@ class ControllerScriptInterfaceLegacy : public QObject {
+     Q_INVOKABLE void trigger(const QString& group, const QString& name);
+     // DEPRECATED: Use console.log instead.
+     Q_INVOKABLE void log(const QString& message);
++    // MixxxCollab: load a file into a deck, and read which file a deck has.
++    Q_INVOKABLE void loadTrackFromLocation(
++            const QString& group, const QString& location, bool play = false);
++    Q_INVOKABLE QString getTrackLocation(const QString& group);
+     Q_INVOKABLE int beginTimer(int interval, QJSValue scriptCode, bool oneShot = false);
+     Q_INVOKABLE void stopTimer(int timerId);
+     Q_INVOKABLE void scratchEnable(int deck,
+diff --git a/src/mixer/playermanager.cpp b/src/mixer/playermanager.cpp
+index 3c765eb..3a211c7 100644
+--- a/src/mixer/playermanager.cpp
++++ b/src/mixer/playermanager.cpp
+@@ -116,6 +116,7 @@ PlayerManager::PlayerManager(UserSettingsPointer pConfig,
+           m_pCONumAuxiliaries(std::make_unique<ControlObject>(
+                   ConfigKey(kAppGroup, QStringLiteral("num_auxiliaries")), true, true)),
+           m_pTrackAnalysisScheduler(TrackAnalysisScheduler::NullPointer()) {
++    s_pInstance = this;
+     m_pCONumDecks->addAlias(ConfigKey(kLegacyGroup, QStringLiteral("num_decks")));
+     m_pCONumDecks->connectValueChangeRequest(this,
+             &PlayerManager::slotChangeNumDecks, Qt::DirectConnection);
+@@ -140,6 +141,9 @@ PlayerManager::PlayerManager(UserSettingsPointer pConfig,
+ 
+ PlayerManager::~PlayerManager() {
+     kLogger.debug() << "Destroying";
++    if (s_pInstance == this) {
++        s_pInstance = nullptr;
++    }
+ 
+     const auto locker = lockMutex(&m_mutex);
+ 
+diff --git a/src/mixer/playermanager.h b/src/mixer/playermanager.h
+index 2b7bc4a..e53599d 100644
+--- a/src/mixer/playermanager.h
++++ b/src/mixer/playermanager.h
+@@ -68,6 +68,12 @@ class PlayerManager : public PlayerManagerInterface {
+             EngineMixer* pEngine);
+     ~PlayerManager() override;
+ 
++    /// The running PlayerManager, so controller scripts can load tracks by
++    /// location (MixxxCollab). Null before construction and after destruction.
++    static PlayerManager* instance() {
++        return s_pInstance;
++    }
++
+     // Add a deck to the PlayerManager
+     // (currently unused, kept for consistency with other types)
+     void addDeck();
+@@ -239,6 +245,7 @@ class PlayerManager : public PlayerManagerInterface {
+     void trackAnalyzerIdle();
+ 
+   private:
++    static inline PlayerManager* s_pInstance = nullptr;
+     TrackPointer lookupTrack(QString location);
+     // Must hold m_mutex before calling this method. Internal method that
+     // creates a new deck.

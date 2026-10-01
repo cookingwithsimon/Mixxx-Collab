@@ -31,6 +31,7 @@ MixxxCollab.MSG_LOOP = 0x07;      // from Mixxx: idx = deck, value = loop length
 // which adds engine.getTrackLocation() and engine.loadTrackFromLocation().
 MixxxCollab.MSG_LOADED = 0x08;    // from Mixxx: the file now loaded on a deck
 MixxxCollab.MSG_LOAD = 0x09;      // to Mixxx: load this file on a deck
+MixxxCollab.MSG_REPORT_TRACKS = 0x0A;  // to Mixxx: report every deck's file again
 MixxxCollab.PATH_CHUNK = 96;      // path bytes per SysEx message (loopMIDI caps SysEx at 256 bytes)
 MixxxCollab.EPSILON = 1e-4;
 
@@ -434,6 +435,14 @@ MixxxCollab.incomingData = function(data, length) {
     }
     if (type === MixxxCollab.MSG_LOAD) {
         MixxxCollab.loadChunk(data, length);
+        return;
+    }
+    if (type === MixxxCollab.MSG_REPORT_TRACKS) {
+        // The bridge (re)started and doesn't know what's loaded.
+        for (var d = 0; d < MixxxCollab.decks.length; d++) {
+            MixxxCollab.lastLocation[d] = null;
+            MixxxCollab.reportTrack(d, 0);
+        }
         return;
     }
     if (length < 11) {

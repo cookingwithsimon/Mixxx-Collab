@@ -71,6 +71,7 @@ MSG_LOOP = 0x07       # from Mixxx: idx = deck, value = active loop length as a 
 # and loopMIDI caps a SysEx message at 256 bytes).
 MSG_LOADED = 0x08     # from Mixxx: the file now loaded on a deck (needs the MixxxCollab Mixxx build)
 MSG_LOAD = 0x09       # to Mixxx:   load this file on a deck
+MSG_REPORT_TRACKS = 0x0A  # to Mixxx: report every deck's loaded file again
 PATH_CHUNK = 96       # path bytes per SysEx message
 # Control idx of each deck's play button, in deck order.
 DECK_PLAY_IDX = [CONTROLS.index((group, "play")) for group in DECKS]
@@ -122,6 +123,9 @@ TRIM_RESEND = 1.0         # resend the trim this often so the mapping knows it's
 MAX_SEEK_LEAD = 0.3       # bounds for the learned seek lead
 START_MATCH = 0.5         # a leader start anchor this close to the play event belongs to it
 PAUSED_TOLERANCE = 0.02   # while both are paused, line up positions further apart than this
+PAUSE_SETTLE = 0.75       # ...but only once the owner's paused position has stopped moving
+LOAD_SETTLE = 3.0         # after a track loads, leave the deck alone this long: Mixxx
+                          # itself moves it (to the cue point, after analysis)
 REFINE_TIME = 4.0         # just after a start, seeks are cheap; for this long...
 REFINE_THRESHOLD = 0.005  # ...seek for errors above this instead of trimming for seconds...
 REFINE_SEEKS = 3          # ...at most this many times
@@ -348,6 +352,7 @@ class DeckSync:
         self.check_landing = False     # next error measurement tells us how a seek landed
         self.refine_until = 0.0        # session time until which small errors still get a seek
         self.refine_left = 0
+        self.settle_until = 0.0        # session time until which a newly loaded deck is left alone
 
     def _predict(self, t):
         """Leader's position and speed (track fraction per second) at session time t."""
@@ -444,13 +449,27 @@ class DeckSync:
         self.hold_until = now + SEEK_HOLD
         self.check_landing = learn
 
+    def track_changed(self, now):
+        """A track was just loaded on this deck, here or on the other side."""
+        with self.lock:
+            self.settle_until = now + LOAD_SETTLE
+            self.leader.clear()
+            self.errors.clear()
+            self.last_error = None
+
     def _align_paused(self, now):
         # While both decks are paused, keep them on the same spot, so a pause
         # that arrived late or a cue press is already lined up for the next
-        # play. Seeking a paused deck is silent.
+        # play. Seeking a paused deck is silent. Right after a load, and
+        # while the owner's deck is still moving (Mixxx jumping to the cue
+        # point once analysis finishes), wait: chasing each of those moves
+        # made the deck bounce. The owner resends its paused position every
+        # second, so this runs again once things are quiet.
         if self.leader_paused is None or self.own_last is None or self.own_last[2]:
             return
-        if not self.leader_speed or now < self.hold_until:
+        if not self.leader_speed or now < self.hold_until or now < self.settle_until:
+            return
+        if now - self.leader_paused[0] < PAUSE_SETTLE:
             return
         target = self.leader_paused[1]
         if abs(self.own_last[1] - target) / self.leader_speed > PAUSED_TOLERANCE:
@@ -589,6 +608,7 @@ class Bridge:
             self.midi_out = mido.open_output(out_name)
             self.midi_in = mido.open_input(in_name, callback=self.on_midi)
         print(f"MIDI: in='{in_name}' out='{out_name}'")
+        self.send_to_mixxx([SYSEX_ID, TO_MIXXX, MSG_REPORT_TRACKS])
         print(f"UDP:  listening on {args.listen}, peer {self.peer_addr[0]}:{self.peer_addr[1]}")
         print(f"Role: {'LEADER' if self.leader else 'follower'}  session={self.session:08x}  "
               f"owns decks {', '.join(str(d + 1) for d in sorted(self.owned))}")
@@ -707,6 +727,8 @@ class Bridge:
     def on_track_loaded(self, deck, location):
         """Our Mixxx loaded location on deck (by a local action or because we asked it to)."""
         rel = self.to_relative(location)
+        if self.deck_track.get(deck) != rel and deck in self.deck_sync:
+            self.deck_sync[deck].track_changed(self.clock.now())
         self.deck_track[deck] = rel
         if not location:
             return
@@ -758,6 +780,8 @@ class Bridge:
         if self.deck_track.get(deck) == rel:
             return
         print(f"Deck {deck + 1}: loading {rel} to match the other side")
+        if deck in self.deck_sync:
+            self.deck_sync[deck].track_changed(self.clock.now())
         for data in chunk_path(MSG_LOAD, deck, location):
             self.send_to_mixxx(data)
 

@@ -33,10 +33,16 @@ There is no loopMIDI on Linux, so the bridge creates the virtual MIDI port itsel
 and must be running before Mixxx starts. Install Mixxx 2.5 first, then:
 
     bash setup.sh
-    bash run.sh --peer <other-pc-ip>:9000 -v
+    bash run.sh --peer <other-pc-ip>:9000 -v --library <path to the shared music folder>
 
 Then start Mixxx and enable the MixxxCollab controller as above. `sync.sh` copies
 the mapping into Mixxx (native and Flatpak installs).
+
+For track loading you need the MixxxCollab build of Mixxx. On SteamOS (or any
+Linux with distrobox), `bash build_linux.sh` builds it inside an Ubuntu 24.04
+container from Mixxx 2.5.6 plus `mixxx-collab.patch`, and `bash
+run_mixxx_linux.sh` starts it. It keeps its settings in `~/.mixxx`, separate
+from a Flatpak Mixxx.
 
 ## Status
 

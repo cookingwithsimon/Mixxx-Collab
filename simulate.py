@@ -92,7 +92,7 @@ class SimMixxx:
             self._emit(cb.MSG_VALUE, idx, value)
 
     def receive(self, data):
-        if data[2] == cb.MSG_SNAPSHOT_REQUEST:
+        if data[2] in (cb.MSG_SNAPSHOT_REQUEST, cb.MSG_REPORT_TRACKS):
             return
         kind, idx = data[2], data[3]
         value = cb.decode_float(data[4:9])
