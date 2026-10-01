@@ -106,16 +106,25 @@ forwarded port, about 26 ms round trip):
   10 s to a phone hotspot). Uploads are capped by `--file-rate` (default
   10 Mbit/s), halved while a deck plays. Only tracks that get loaded are
   copied; there's no full-library sync yet.
+- **Session panel:** each bridge serves a small page at http://127.0.0.1:8765/
+  (opened automatically; `--panel-port`, `--no-browser`) showing the partner,
+  link, clock, who holds the crossfader and master, and each deck's owner,
+  track and sync state, with Take control / Hand over buttons, the invite or
+  reply code, and a box for the partner's reply code. It only listens on this
+  machine.
+- **Crossfader and master token:** one DJ at a time moves the crossfader and
+  master gain (the leader starts with it). The other DJ's moves are undone
+  locally; after taking control, a fader only goes live once it reaches the
+  current position, so the mix doesn't jump. The leader arbitrates, so if both
+  press at once, one wins.
 - **Internet sessions:** invite and reply codes, signed packets, STUN, optional
   UPnP, `--resume`, a warning on strict networks, and port forwarding as the
   fallback (see Internet sessions above).
 
 
 Not yet: copying the whole library ahead of a session; a relay for when
-neither side can forward a port; the session panel
-with handoff buttons (designed in the integration plan); the control token for
-the crossfader and master (both DJs can move them, and the last move wins);
-compensation for each machine's output latency, which only matters if both
+neither side can forward a port; starting sessions and moving deck ownership
+from the panel (the integration plan designs both); compensation for each machine's output latency, which only matters if both
 machines' audio is heard together.
 
 Effect and chain preset choices travel as positions in Mixxx's effect lists, so

@@ -31,6 +31,7 @@ import mido
 
 import filesync
 import nat
+import panel
 
 DECKS = [f"[Channel{n}]" for n in range(1, 5)]   # must match MixxxCollab.decks
 
@@ -56,7 +57,11 @@ for _u in (1, 2):
         CONTROLS += [(f"[EffectRack1_EffectUnit{_u}_Effect{_e}]", "loaded_effect"),
                      (f"[EffectRack1_EffectUnit{_u}_Effect{_e}]", "enabled"),
                      (f"[EffectRack1_EffectUnit{_u}_Effect{_e}]", "meta")]
+CONTROLS += [("[Master]", "gain")]     # master output level
 assert len(CONTROLS) < 128
+# The crossfader and master gain have one writer at a time: whoever holds the
+# control token (see "The control token" in the protocol spec).
+SHARED_IDX = {CONTROLS.index(("[Master]", "crossfader")), CONTROLS.index(("[Master]", "gain"))}
 PLAY_IDX = {i for i, (_, key) in enumerate(CONTROLS) if key == "play"}
 
 # SysEx protocol (see MixxxCollab.js)
@@ -90,6 +95,11 @@ VALUE_FMT = "!BIBfd"
 NET_POSITION = 5  # !BIBddBd type, session, deck, session time, playposition, playing, speed
 POSITION_FMT = "!BIBddBd"
 NET_HELLO = 2   # !BI     type, session
+NET_TOKEN = 11    # !BIIBd   leader -> follower: token epoch, holder (0 leader, 1 follower), session time it moved
+NET_TOKEN_REQ = 12  # !BIBI  follower -> leader: 1 take / 2 hand over, epoch the follower last saw
+TOKEN_FMT = "!BIIBd"
+TOKEN_REQ_FMT = "!BIBI"
+TAKE, HAND_OVER = 1, 2
 NET_LOAD = 6     # !BIBd + UTF-8 path: type, session, deck, session time of the load,
                  # path relative to the shared music folder, with / separators
 LOAD_FMT = "!BIBd"
@@ -593,6 +603,14 @@ class Bridge:
         self.session = random.getrandbits(32)
         self.midi_lock = threading.Lock()
         self.impair = Impairment(args.impair) if args.impair else None
+        # The leader starts with the crossfader and master token.
+        self.token = {"epoch": 0, "holder": 0, "changed_at": 0.0}
+        self.token_pending = None       # (action, time) while a request awaits the leader
+        self.pickup = {}                # shared control idx -> which side the fader was on
+        self.last_token_nag = 0.0
+        self.notices = []
+        self.invite_code = None         # shown on the panel
+        self.reply_code = None
         # Track loading: paths travel relative to each machine's copy of the
         # shared music folder, so the same file can sit at different places.
         self.library = os.path.normpath(args.library) if args.library else None
@@ -768,6 +786,8 @@ class Bridge:
                 self.deck_sync[idx].loop_len = max(0.0, value)
             return
         if d[2] != MSG_VALUE or idx >= len(CONTROLS):
+            return
+        if idx in SHARED_IDX and not self.allow_shared_move(idx, value):
             return
         if idx in PLAY_IDX:
             self.playing[idx] = value > 0.5
@@ -952,6 +972,179 @@ class Bridge:
     def request_snapshot(self):
         self.send_to_mixxx([SYSEX_ID, TO_MIXXX, MSG_SNAPSHOT_REQUEST])
 
+    # ---- the control token for the crossfader and master gain ----
+    def i_hold_token(self):
+        return (self.token["holder"] == 0) == self.leader
+
+    def agreed_value(self, idx):
+        with self.state_lock:
+            entry = self.state.get(idx)
+        return None if entry is None else entry["value"]
+
+    def allow_shared_move(self, idx, value):
+        """Our DJ moved the crossfader or master gain. Without the token the
+        move is undone; just after taking it, the move only counts once the
+        physical control reaches the current position (soft takeover), so
+        taking control never makes the mix jump."""
+        agreed = self.agreed_value(idx)
+        if not self.i_hold_token():
+            if agreed is not None:
+                self.send_to_mixxx([SYSEX_ID, TO_MIXXX, MSG_VALUE, idx] + encode_float(agreed))
+            now = time.time()
+            if now - self.last_token_nag > 5:
+                self.last_token_nag = now
+                self.notice(f"{self.partner_name()} has the crossfader and master; press Take control to use them")
+            return False
+        if idx in self.pickup and agreed is not None:
+            side = value > agreed
+            if abs(value - agreed) > 0.04 and self.pickup[idx] in (None, side):
+                self.pickup[idx] = side
+                self.send_to_mixxx([SYSEX_ID, TO_MIXXX, MSG_VALUE, idx] + encode_float(agreed))
+                return False
+            del self.pickup[idx]      # crossed or reached it: it's live
+        return True
+
+    def set_token(self, epoch, holder, changed_at):
+        before = self.i_hold_token()
+        self.token = {"epoch": epoch, "holder": holder, "changed_at": changed_at}
+        self.token_pending = None
+        if self.i_hold_token() and not before:
+            self.pickup = {idx: None for idx in SHARED_IDX}
+            self.notice("You have the crossfader and master")
+        elif before and not self.i_hold_token():
+            self.pickup = {}
+            self.notice(f"{self.partner_name()} has the crossfader and master now")
+
+    def broadcast_token(self):
+        t = self.token
+        self.send(struct.pack(TOKEN_FMT, NET_TOKEN, self.session, t["epoch"], t["holder"], t["changed_at"]))
+
+    def token_action(self, action):
+        """The DJ pressed Take control (TAKE) or Hand over (HAND_OVER)."""
+        if self.leader:
+            # The leader arbitrates, so its own presses take effect at once.
+            want = 0 if action == TAKE else 1
+            if self.token["holder"] != want:
+                self.set_token(self.token["epoch"] + 1, want, self.clock.now())
+                self.broadcast_token()
+        else:
+            self.token_pending = (action, time.time())
+            self.send(struct.pack(TOKEN_REQ_FMT, NET_TOKEN_REQ, self.session, action, self.token["epoch"]))
+
+    def on_token_request(self, action, epoch_seen):
+        if not self.leader:
+            return
+        if epoch_seen == self.token["epoch"]:
+            want = 1 if action == TAKE else 0
+            if self.token["holder"] != want:
+                self.set_token(self.token["epoch"] + 1, want, self.clock.now())
+        # Otherwise the follower acted on an old state (we both pressed at
+        # once): the leader's state stands, and resending it tells them.
+        self.broadcast_token()
+
+    def on_token(self, epoch, holder, changed_at):
+        if self.leader:
+            return
+        pending = self.token_pending
+        if epoch > self.token["epoch"] or (pending and epoch == self.token["epoch"]):
+            moved = epoch > self.token["epoch"]
+            self.set_token(epoch, holder, changed_at)
+            if pending and not moved:
+                self.notice(f"{self.partner_name()} kept the crossfader and master")
+
+    # ---- the session panel ----
+    def use_reply(self, code):
+        try:
+            addrs, matches = nat.read_reply(self.secret, code)
+        except (ValueError, TypeError) as e:
+            self.notice(f"Reply code not accepted: {e}")
+            return False
+        self.add_candidates(addrs)
+        self.notice("Reply code accepted; reaching the partner at "
+                    + ", ".join(f"{ip}:{port}" for ip, port in addrs))
+        if not matches:
+            self.notice("(its check characters don't match this session's invite; trying anyway)")
+        return True
+
+    def deck_status(self, deck, connected):
+        """(text, colour) for one deck on the panel."""
+        with self.state_lock:
+            load = self.loads.get(deck)
+        track = load["path"] if load else self.deck_track.get(deck)
+        if not track or track == "unknown":
+            return "Empty", ""
+        if self.files and track in self.files.incoming:
+            inc = self.files.incoming[track]
+            done = 100 * inc.have // inc.chunks if inc.chunks else 0
+            return f"Fetching from partner ({done}%)", "amber"
+        if not self.same_track(deck):
+            return "Different track on each side", "red"
+        playing = self.playing.get(DECK_PLAY_IDX[deck])
+        if deck in self.owned:
+            return ("Playing" if playing else "Paused"), "green"
+        if not connected:
+            return "Partner offline", "red"
+        if not playing:
+            return "Paused", "green"
+        sync = self.deck_sync.get(deck)
+        if sync is None or sync.last_error is None:
+            return "Lining up", "amber"
+        error = sync.last_error * 1000
+        if abs(error) < 5:
+            return "In sync", "green"
+        return f"Correcting ({error:+.0f} ms)", "amber"
+
+    def panel_state(self):
+        now = time.time()
+        connected = self.connected()
+        status = self.clock.status() if connected else None
+        decks = []
+        for d in range(len(DECKS)):
+            text, colour = self.deck_status(d, connected)
+            with self.state_lock:
+                load = self.loads.get(d)
+            track = load["path"] if load else self.deck_track.get(d)
+            name = track.rsplit("/", 1)[-1].rsplit(".", 1)[0] if track and track != "unknown" else None
+            decks.append({"deck": d + 1, "mine": d in self.owned, "state": text, "colour": colour,
+                          "track": name})
+        with self.state_lock:
+            notices = [{"ago": panel.ago(now - t), "text": text} for t, text in self.notices]
+        return {
+            "connected": connected,
+            "last_seen_s": (now - self.peer_last_seen) if self.peer_session is not None else None,
+            "rtt_ms": status["rtt"] * 1000 if status else None,
+            "clock_locked": bool(self.leader or (status and status["locked"])),
+            "leader": self.leader,
+            "internet": bool(self.secret),
+            "token": {"mine": self.i_hold_token(), "pending": self.token_pending is not None},
+            "decks": decks,
+            "invite": self.invite_code if not connected else None,
+            "reply": self.reply_code if not connected else None,
+            "wants_reply": bool(self.secret and self.leader and not connected),
+            "notices": notices,
+        }
+
+    def panel_action(self, name, body):
+        if name == "take" and self.connected() and not self.i_hold_token():
+            self.token_action(TAKE)
+            return True
+        if name == "handover" and self.connected() and self.i_hold_token():
+            self.token_action(HAND_OVER)
+            return True
+        if name == "reply" and self.secret and isinstance(body.get("code"), str):
+            return self.use_reply(body["code"])
+        return False
+
+    # ---- notices for the panel ----
+    def notice(self, text):
+        print(f"* {text}")
+        with self.state_lock:
+            self.notices.append((time.time(), text))
+            del self.notices[:-20]
+
+    def partner_name(self):
+        return "The partner"
+
     def note_peer(self, session):
         now = time.time()
         was_connected = self.peer_session is not None and now - self.peer_last_seen < PEER_TIMEOUT
@@ -961,6 +1154,7 @@ class Bridge:
             self.peer_session = session
         if new_session or not was_connected:
             print(f"Peer connected (session={session:08x})")
+            self.notice("Partner connected")
             self.clock.reset()
             self.burst_left = JOIN_BURST
             if self.leader:
@@ -1009,6 +1203,8 @@ class Bridge:
         """A control value from the peer, changed at session time ts."""
         if idx >= len(CONTROLS):
             return
+        if idx in SHARED_IDX and (self.i_hold_token() or ts < self.token["changed_at"]):
+            return  # from a DJ who doesn't (or didn't then) hold the crossfader and master
         with self.state_lock:
             entry = self.state.get(idx)
             if entry is not None and ts <= self.entry_time(entry):
@@ -1047,6 +1243,14 @@ class Bridge:
             _, session, deck, ts = struct.unpack_from(LOAD_FMT, data)
             self.note_peer(session)
             self.on_remote_load(deck, ts, data[struct.calcsize(LOAD_FMT):].decode("utf-8", "replace"))
+        elif kind == NET_TOKEN and len(data) == struct.calcsize(TOKEN_FMT):
+            _, session, epoch, holder, changed_at = struct.unpack(TOKEN_FMT, data)
+            self.note_peer(session)
+            self.on_token(epoch, holder, changed_at)
+        elif kind == NET_TOKEN_REQ and len(data) == struct.calcsize(TOKEN_REQ_FMT):
+            _, session, action, epoch_seen = struct.unpack(TOKEN_REQ_FMT, data)
+            self.note_peer(session)
+            self.on_token_request(action, epoch_seen)
         elif kind == NET_HELLO and len(data) == struct.calcsize("!BI"):
             _, session = struct.unpack("!BI", data)
             self.note_peer(session)
@@ -1095,8 +1299,16 @@ class Bridge:
                 hinted = True
             if was_connected and not connected:
                 print("Peer lost; trying to reach it again")
+                self.notice("Partner lost; trying to reach them again")
             was_connected = connected
             time.sleep(0.05)
+
+    def resend_token(self):
+        if self.leader:
+            self.broadcast_token()
+        elif self.token_pending and time.time() - self.token_pending[1] > 2.0:
+            self.token_pending = None
+            self.notice("No answer from the leader about the crossfader; try again")
 
     def resend(self):
         """Repeat what the peer might have missed: our latest control values,
@@ -1106,6 +1318,7 @@ class Bridge:
         for idx in ours:
             self.send_value(idx)
         self.send_following()
+        self.resend_token()
         with self.state_lock:
             our_loads = [deck for deck, entry in self.loads.items() if entry["local"] is not None]
         for deck in our_loads:
@@ -1206,6 +1419,9 @@ def main():
     p.add_argument("--resume", action="store_true",
                    help="reconnect the last internet session without new codes")
     p.add_argument("--no-upnp", action="store_true", help="leader: don't ask the router to forward the port")
+    p.add_argument("--panel-port", type=int, default=8765, metavar="PORT",
+                   help="local port for the session panel web page (0: no panel)")
+    p.add_argument("--no-browser", action="store_true", help="don't open the session panel automatically")
     p.add_argument("--leader", action="store_true", help="this side's state wins on connect")
     p.add_argument("--verbose", "-v", action="store_true", help="log every control change")
     p.add_argument("--list-ports", action="store_true", help="list MIDI ports and exit")
@@ -1276,14 +1492,24 @@ def main():
                     public = result
                 else:
                     print(f"No port forward: {result}. The reply code will be needed.")
-            print("\n  Invite code for your partner:\n\n    " + nat.make_invite(args.secret, public, lan) + "\n")
+            bridge.invite_code = nat.make_invite(args.secret, public, lan)
+            print("\n  Invite code for your partner:\n\n    " + bridge.invite_code + "\n")
             threading.Thread(target=wait_for_reply, args=(bridge, args.reply), daemon=True).start()
         elif args.resume and args.leader:
             threading.Thread(target=wait_for_reply, args=(bridge, args.reply), daemon=True).start()
         elif args.join:
-            print("\n  Send this reply code back to the leader:\n\n    "
-                  + nat.make_reply(args.secret, public, lan) + "\n")
+            bridge.reply_code = nat.make_reply(args.secret, public, lan)
+            print("\n  Send this reply code back to the leader:\n\n    " + bridge.reply_code + "\n")
         bridge.save_session()
+    if args.panel_port:
+        try:
+            url = panel.start(bridge, args.panel_port)
+            print(f"Session panel: {url}")
+            if not args.no_browser:
+                import webbrowser
+                webbrowser.open(url)
+        except OSError as e:
+            print(f"Couldn't start the session panel on port {args.panel_port}: {e}")
     bridge.run(recv_started=True)
 
 
@@ -1305,16 +1531,7 @@ def wait_for_reply(bridge, code):
             except EOFError:
                 asking = False   # no keyboard (started in the background): use reply.txt
         if code:
-            try:
-                addrs, matches = nat.read_reply(bridge.secret, code)
-                bridge.add_candidates(addrs)
-                print("Reply code accepted; reaching the partner at "
-                      + ", ".join(f"{ip}:{port}" for ip, port in addrs))
-                if not matches:
-                    print("  (its check characters don't match this session's invite; "
-                          "trying the addresses anyway)")
-            except ValueError as e:
-                print(f"Reply code not accepted: {e}")
+            bridge.use_reply(code)
             code = None
         time.sleep(1)
 

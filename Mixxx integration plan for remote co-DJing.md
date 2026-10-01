@@ -144,6 +144,8 @@ Every handoff also appears on the other DJ's panel as a short notice, for exampl
 
 Start with the companion app's panel. Where a controller mapping has a spare button and LED, mirror "Take control" and the token indicator onto it, so the most common handoff doesn't need the screen.
 
+The prototype follows this: the bridge serves the panel as a local web page with the indicators, Take control and Hand over, and the session codes. Deck ownership moves and leader handover are not built yet.
+
 ## Milestones
 
 Six stages, each ending in a check that can be run, ordered so the riskiest unknown (timing over the internet) is tested before the polish.

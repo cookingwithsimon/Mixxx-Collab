@@ -95,6 +95,7 @@ MixxxCollab.decks.forEach(function(g) {
         MixxxCollab.controls.push([effect, "loaded_effect"], [effect, "enabled"], [effect, "meta"]);
     });
 });
+MixxxCollab.controls.push(["[Master]", "gain"]);  // master output level
 
 // Values recently applied from the network, per control index, as [value, time]
 // pairs, so the resulting change callbacks aren't echoed straight back to the
