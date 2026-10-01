@@ -29,6 +29,7 @@ import time
 
 import mido
 
+import filesync
 import nat
 
 DECKS = [f"[Channel{n}]" for n in range(1, 5)]   # must match MixxxCollab.decks
@@ -539,6 +540,12 @@ class DeckSync:
                 self.trim(self.deck, trim)
 
 
+def session_ok(data, peer_session):
+    """File packets carry no session id of their own (0); they're accepted
+    once a peer is connected, and they're signed on internet sessions."""
+    return peer_session is not None and len(data) >= 9
+
+
 def chunk_path(kind, deck, path):
     """SysEx data messages carrying path to/from Mixxx, nibble-encoded in chunks."""
     raw = path.encode("utf-8")
@@ -592,6 +599,11 @@ class Bridge:
         self.loads = {}                # deck -> {"path", "ts", "local"}, newest wins as with values
         self.deck_track = {}           # deck -> relative path our Mixxx has loaded (None: outside library)
         self.path_chunks = {}          # deck -> {chunk: bytes} while a path arrives from Mixxx
+        # Copies tracks the partner loads that we don't have (and sends ours).
+        self.files = None
+        if self.library:
+            self.files = filesync.FileSync(self.library, self.send, args.file_rate * 1e6 / 8,
+                                           lambda: any(self.playing.values()))
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("0.0.0.0", args.listen))
@@ -875,10 +887,25 @@ class Bridge:
         if not self.library:
             print(f"Deck {deck + 1}: other side loaded {rel}, but no --library is set here")
             return
-        location = os.path.join(self.library, *rel.split("/"))
-        if not os.path.exists(location):
-            print(f"Deck {deck + 1}: other side loaded {rel}, MISSING here ({location})")
+        location = filesync.safe_path(self.library, rel)
+        if location is None:
+            print(f"Deck {deck + 1}: other side loaded {rel}, which isn't a path inside the music folder")
             return
+        if not os.path.exists(location):
+            if self.files:
+                print(f"Deck {deck + 1}: other side loaded {rel}, missing here; fetching it")
+                self.files.fetch(rel, self.on_fetched)
+            return
+        self.load_locally(deck, rel, location)
+
+    def on_fetched(self, rel):
+        """A fetched file arrived: load it on every deck that should have it."""
+        with self.state_lock:
+            decks = [d for d, entry in self.loads.items() if entry["path"] == rel]
+        for deck in decks:
+            self.load_locally(deck, rel, filesync.safe_path(self.library, rel))
+
+    def load_locally(self, deck, rel, location):
         if self.deck_track.get(deck) == rel:
             return
         print(f"Deck {deck + 1}: loading {rel} to match the other side")
@@ -1003,6 +1030,12 @@ class Bridge:
             sync = self.deck_sync.get(deck)
             if session == self.peer_session and sync and self.clock.synced and self.same_track(deck):
                 sync.leader_report(t, pos, bool(playing), speed, self.clock.now())
+        elif kind in (filesync.NET_FILE_REQ, filesync.NET_FILE_INFO, filesync.NET_FILE_DATA,
+                      filesync.NET_FILE_NEED):
+            if self.files and session_ok(data, self.peer_session):
+                {filesync.NET_FILE_REQ: self.files.on_request, filesync.NET_FILE_INFO: self.files.on_info,
+                 filesync.NET_FILE_DATA: self.files.on_data, filesync.NET_FILE_NEED: self.files.on_need,
+                 }[kind](data)
         elif kind == NET_LOAD and len(data) > struct.calcsize(LOAD_FMT):
             _, session, deck, ts = struct.unpack_from(LOAD_FMT, data)
             self.note_peer(session)
@@ -1171,6 +1204,9 @@ def main():
     p.add_argument("--list-ports", action="store_true", help="list MIDI ports and exit")
     p.add_argument("--library", metavar="FOLDER",
                    help="this machine's path to the shared music folder; enables track loading")
+    p.add_argument("--file-rate", type=float, default=10.0, metavar="MBIT",
+                   help="most upload bandwidth for sending tracks to the partner, in Mbit/s "
+                        "(half of it while a deck plays; default 10)")
     p.add_argument("--own-decks", metavar="LIST",
                    help="decks whose playhead this side owns, e.g. 1,2 (default: leader 1,2, follower 3,4)")
     p.add_argument("--no-deck-sync", action="store_true",
