@@ -162,8 +162,12 @@ def upnp_forward(port, description="MixxxCollab"):
     try:
         u = miniupnpc.UPnP()
         u.discoverdelay = 1500
-        if u.discover() == 0:
-            return None, "no UPnP router answered"
+        try:
+            found = u.discover()
+        except Exception:      # miniupnpc raises (oddly, "Success") when nothing answers
+            found = 0
+        if found == 0:
+            return None, "no UPnP router answered (UPnP may be off on the router)"
         u.selectigd()
         external_ip = u.externalipaddress()
         u.addportmapping(port, "UDP", u.lanaddr, port, description, "")

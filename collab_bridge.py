@@ -1201,6 +1201,7 @@ def wait_for_reply(bridge, code):
     """The leader learns the partner's addresses from the reply code. Often
     not needed (the partner's packets get through first), so it's optional."""
     path = os.path.join(os.path.dirname(SESSION_FILE), "reply.txt")
+    asking = bool(sys.stdin and sys.stdin.isatty())
     while not code:
         if bridge.connected():
             return
@@ -1208,8 +1209,11 @@ def wait_for_reply(bridge, code):
             with open(path) as f:
                 code = f.read().strip()
             os.remove(path)
-        elif sys.stdin and sys.stdin.isatty():
-            code = input("  Paste the partner's reply code (or just wait if it connects): ").strip()
+        elif asking:
+            try:
+                code = input("  Paste the partner's reply code (or just wait if it connects): ").strip()
+            except EOFError:
+                asking = False   # no keyboard (started in the background): use reply.txt
         else:
             time.sleep(1)
     try:
