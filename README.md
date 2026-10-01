@@ -42,10 +42,16 @@ the mapping into Mixxx (native and Flatpak installs).
 
 Working on a LAN and over Wi-Fi between Windows and SteamOS:
 
-- Mixer controls (crossfader; play, volume, gain, rate, EQ and filter on decks 1
-  and 2) mirror both ways. Every change carries its session time, the newest
-  wins, and each side resends its latest values every second, so lost or late
-  packets repair themselves.
+- Controls mirror both ways: crossfader; on all four decks play, volume, gain,
+  rate, keylock, 3-band EQ, quick effect (filter) and loops; and effect units 1
+  and 2 (mix, meta knob, on/off, deck assignment, each effect's on/off and
+  meta). Every change carries its session time, the newest wins, and each side
+  resends its latest values every second, so lost or late packets repair
+  themselves. Cue, hotcues and beatjump aren't sent as buttons; the jump they
+  cause is followed as a position change.
+- Each deck has an owner (by default the leader owns decks 1 and 2, the
+  follower 3 and 4; `--own-decks` changes it) whose playhead the other side
+  follows.
 - A shared session clock (ping-pong with drift tracking) and deck sync: the
   follower keeps each deck on the leader's playhead with seeks and small speed
   trims. In tests with a 600 ms stall every 7 s and 5% loss, steady playback
@@ -55,8 +61,9 @@ Testing tools: `--impair` on the bridge degrades the network on purpose,
 `simulate.py` runs two bridges against simulated decks, and `make_click_track.py`
 plus `measure_sync.py` measure real machines through a line-in.
 
-Not yet: decks 3 and 4, cue/loops/hotcues, compensation for each machine's
-output latency, internet play (NAT traversal), and file sync.
+Not yet: loading tracks (load the same file on both sides by hand), compensation
+for each machine's output latency, internet play (NAT traversal), and file sync.
+Effect units only match if both machines have the same effects loaded.
 
 ## License
 

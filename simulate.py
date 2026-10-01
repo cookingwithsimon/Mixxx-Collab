@@ -81,6 +81,11 @@ class SimMixxx:
             self.playing = playing
             self._play_changed(local=True)
 
+    def jump(self, seconds):
+        with self.lock:
+            self._advance()
+            self.pos += seconds / TRACK
+
     def press_value(self, idx, value):
         with self.lock:
             self.values[idx] = value
@@ -114,7 +119,7 @@ def make_bridge(sim, listen, peer, leader, impair, skew, drift=0.0):
     args = types.SimpleNamespace(
         leader=leader, verbose=False, test_clock_skew=skew, test_clock_drift=drift,
         clock_log=None, no_deck_sync=False, sync_log=None, impair=impair,
-        peer=f"127.0.0.1:{peer}", listen=listen, virtual=False, midi="sim")
+        peer=f"127.0.0.1:{peer}", listen=listen, virtual=False, midi="sim", own_decks=None)
     mido.get_input_names = lambda: ["sim"]
     mido.get_output_names = lambda: ["sim"]
     holder = {}
@@ -149,7 +154,8 @@ def main(impair, title):
 
     at(1); foll_sim.press_play(False)       # follower has its own (old) pause on record
     at(4)                                   # connect, clock lock
-    lead_sim.press_play(True); at(20)
+    lead_sim.press_play(True); at(12)
+    lead_sim.jump(30.0); at(20)               # hotcue press on the owner's deck
     for i in range(30):                     # wiggle a fader through the bad link
         lead_sim.press_value(2, i / 30); at(20 + 0.05 * (i + 1))
     lead_sim.press_value(2, 0.777); at(24)
@@ -161,7 +167,9 @@ def main(impair, title):
         return (f"{min(v):+8.1f} .. {max(v):+8.1f} ms" if v else "n/a")
     print(f"=== {title} ===")
     print("  first 2 s after play     :", span(4, 6))
-    print("  6-20 s, steady           :", span(6, 20))
+    print("  6-12 s, steady           :", span(6, 12))
+    print("  12-13 s, owner jumped 30 s:", span(12, 13))
+    print("  13-20 s, after the jump  :", span(13, 20))
     print("  20-24 s, during fader burst:", span(20, 24))
     print("  while both paused (24-27):", span(24.5, 27, playing_only=False))
     print("  2 s after second play    :", span(27, 29))

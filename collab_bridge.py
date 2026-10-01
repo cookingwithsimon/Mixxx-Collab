@@ -27,26 +27,31 @@ import time
 
 import mido
 
-# Must match MixxxCollab.controls in MixxxCollab.js (same order).
-CONTROLS = [
-    ("[Master]", "crossfader"),
-    ("[Channel1]", "play"),
-    ("[Channel1]", "volume"),
-    ("[Channel1]", "pregain"),
-    ("[Channel1]", "rate"),
-    ("[EqualizerRack1_[Channel1]_Effect1]", "parameter1"),
-    ("[EqualizerRack1_[Channel1]_Effect1]", "parameter2"),
-    ("[EqualizerRack1_[Channel1]_Effect1]", "parameter3"),
-    ("[QuickEffectRack1_[Channel1]]", "super1"),
-    ("[Channel2]", "play"),
-    ("[Channel2]", "volume"),
-    ("[Channel2]", "pregain"),
-    ("[Channel2]", "rate"),
-    ("[EqualizerRack1_[Channel2]_Effect1]", "parameter1"),
-    ("[EqualizerRack1_[Channel2]_Effect1]", "parameter2"),
-    ("[EqualizerRack1_[Channel2]_Effect1]", "parameter3"),
-    ("[QuickEffectRack1_[Channel2]]", "super1"),
-]
+DECKS = [f"[Channel{n}]" for n in range(1, 5)]   # must match MixxxCollab.decks
+
+# Must match MixxxCollab.controls in MixxxCollab.js: built the same way, and
+# the index (under 128) is what goes over the wire.
+CONTROLS = [("[Master]", "crossfader")]
+for _g in DECKS:
+    CONTROLS += [
+        (_g, "play"), (_g, "volume"), (_g, "pregain"), (_g, "rate"), (_g, "keylock"),
+        (f"[EqualizerRack1_{_g}_Effect1]", "parameter1"),
+        (f"[EqualizerRack1_{_g}_Effect1]", "parameter2"),
+        (f"[EqualizerRack1_{_g}_Effect1]", "parameter3"),
+        (f"[QuickEffectRack1_{_g}]", "loaded_chain_preset"),
+        (f"[QuickEffectRack1_{_g}]", "super1"),
+        (f"[QuickEffectRack1_{_g}]", "enabled"),
+        (_g, "loop_start_position"), (_g, "loop_end_position"), (_g, "loop_enabled"),
+    ]
+for _u in (1, 2):
+    _unit = f"[EffectRack1_EffectUnit{_u}]"
+    CONTROLS += [(_unit, "loaded_chain_preset"), (_unit, "mix"), (_unit, "super1"), (_unit, "enabled")]
+    CONTROLS += [(_unit, f"group_{_g}_enable") for _g in DECKS]
+    for _e in (1, 2, 3):
+        CONTROLS += [(f"[EffectRack1_EffectUnit{_u}_Effect{_e}]", "loaded_effect"),
+                     (f"[EffectRack1_EffectUnit{_u}_Effect{_e}]", "enabled"),
+                     (f"[EffectRack1_EffectUnit{_u}_Effect{_e}]", "meta")]
+assert len(CONTROLS) < 128
 PLAY_IDX = {i for i, (_, key) in enumerate(CONTROLS) if key == "play"}
 
 # SysEx protocol (see MixxxCollab.js)
@@ -59,7 +64,7 @@ MSG_POSITION = 0x03   # from Mixxx: idx = deck, value = playposition (0..1)
 MSG_SEEK = 0x04       # to Mixxx:   idx = deck, value = playposition to jump to
 MSG_TRIM = 0x05       # to Mixxx:   idx = deck, value = relative speed trim
 MSG_SPEED = 0x06      # from Mixxx: idx = deck, value = playback speed in track fractions per second
-DECKS = ["[Channel1]", "[Channel2]"]   # must match MixxxCollab.decks
+MSG_LOOP = 0x07       # from Mixxx: idx = deck, value = active loop length as a track fraction, 0 if none
 # Control idx of each deck's play button, in deck order.
 DECK_PLAY_IDX = [CONTROLS.index((group, "play")) for group in DECKS]
 
@@ -208,7 +213,7 @@ class SessionClock:
         self.offset = 0.0     # add to local time to get session time
         self.drift = 0.0      # estimated rate difference between the two clocks
         self.fit_spread = None  # scatter of the samples the drift fit is built from
-        self.synced = False   # offset has been set from a full burst
+        self.synced = leader  # offset has been set from a full burst (the leader is the reference)
         self.last_slew = self.local()
 
     def local(self):
@@ -224,7 +229,7 @@ class SessionClock:
     def reset(self):
         with self.lock:
             self.samples.clear()
-            self.synced = False
+            self.synced = self.leader
 
     def add_sample(self, t0, t1, t2, t3):
         """t0/t3: our local send/receive times; t1/t2: peer's receive/reply times."""
@@ -328,6 +333,7 @@ class DeckSync:
         self.pending_start = None     # session time of a play we received but haven't anchored
         self.own_last = None          # (session time, position, playing) of our latest report
         self.leader_latest = float("-inf")  # newest leader report time seen
+        self.loop_len = 0.0           # our active loop, as a track fraction (0: none)
         self.seek_lead = SEEK_LEAD     # learned from where our seeks actually land
         self.check_landing = False     # next error measurement tells us how a seek landed
         self.refine_until = 0.0        # session time until which small errors still get a seek
@@ -373,9 +379,16 @@ class DeckSync:
                 self._catch_up_start(now)
             predicted = self._predict(t)
             if predicted and abs(pos - predicted[0]) / predicted[1] > JUMP_THRESHOLD:
-                # The leader seeked, looped or restarted: start a new history.
+                # The owner jumped (hotcue, cue, beatjump, seek) or its loop
+                # wrapped around: start a new history. A loop wrap happens
+                # here too, on its own, so only follow a real jump straight
+                # away rather than waiting for the error to build up.
+                jump = abs(pos - predicted[0])
+                wrapped = self.loop_len > 0 and abs(jump - self.loop_len) / predicted[1] < JUMP_THRESHOLD
                 self.leader.clear()
                 self.errors.clear()
+                if not wrapped and self.own_last is not None and self.own_last[2]:
+                    self._jump_to(t, pos, now)
             self.leader.append((t, pos))
             while t - self.leader[0][0] > LEADER_HISTORY:
                 self.leader.popleft()
@@ -403,10 +416,16 @@ class DeckSync:
         self.refine_until = now + REFINE_TIME
         self.refine_left = REFINE_SEEKS
         if now - t0 >= LATE_START:
-            # Jump ahead to where the leader is by now. Seeks issued as a
-            # deck starts land less predictably (seen on the Ally), so this
-            # one doesn't teach us the seek lead; the refinements fix it up.
-            self._seek_to(pos0 + self.leader_speed * (now - t0 + self.seek_lead), now, learn=False)
+            self._jump_to(t0, pos0, now)
+
+    def _jump_to(self, t0, pos0, now):
+        # Go to where the owner is by now, given it was at pos0 at session
+        # time t0. Seeks issued as a deck starts or jumps land less
+        # predictably (seen on the Ally), so this doesn't teach us the seek
+        # lead; the quick refinements that follow fix it up.
+        self.refine_until = now + REFINE_TIME
+        self.refine_left = REFINE_SEEKS
+        self._seek_to(pos0 + self.leader_speed * (now - t0 + self.seek_lead), now, learn=False)
 
     def _seek_to(self, target, now, learn=True):
         self.seek(self.deck, min(max(target, 0.0), 1.0))
@@ -449,7 +468,13 @@ class DeckSync:
             if predicted is None:
                 return
             expected, speed = predicted
-            self.errors.append((pos - expected) / speed)
+            diff = pos - expected
+            if self.loop_len > 0:
+                # Both decks loop the same section, so compare positions
+                # around the loop: just before and just after its start are
+                # close, not a loop length apart.
+                diff = (diff + self.loop_len / 2) % self.loop_len - self.loop_len / 2
+            self.errors.append(diff / speed)
             if len(self.errors) < 3:
                 return
             error = statistics.median(self.errors)
@@ -490,11 +515,17 @@ class Bridge:
             self.clock_log.write("local_time,rtt,raw_offset,applied_offset,drift\n")
         self.burst_left = 0
         self.pending_pings = set()  # t0 of pings not yet answered
-        # The leader's playhead is authoritative; only the follower corrects.
+        # Each deck has an owner whose playhead is authoritative; we correct
+        # the decks the other machine owns.
         self.positions_sent = 0
-        self.deck_sync = []
-        if not args.leader and not args.no_deck_sync:
-            self.deck_sync = [DeckSync(d, self.send_seek, self.send_trim) for d in range(len(DECKS))]
+        if args.own_decks:
+            self.owned = {int(n) - 1 for n in args.own_decks.split(",")}
+        else:
+            self.owned = {0, 1} if args.leader else {2, 3}
+        self.deck_sync = {}
+        if not args.no_deck_sync:
+            self.deck_sync = {d: DeckSync(d, self.send_seek, self.send_trim)
+                              for d in range(len(DECKS)) if d not in self.owned}
         self.sync_log = None
         if args.sync_log:
             self.sync_log = open(args.sync_log, "w")
@@ -534,7 +565,8 @@ class Bridge:
             self.midi_in = mido.open_input(in_name, callback=self.on_midi)
         print(f"MIDI: in='{in_name}' out='{out_name}'")
         print(f"UDP:  listening on {args.listen}, peer {self.peer_addr[0]}:{self.peer_addr[1]}")
-        print(f"Role: {'LEADER' if self.leader else 'follower'}  session={self.session:08x}")
+        print(f"Role: {'LEADER' if self.leader else 'follower'}  session={self.session:08x}  "
+              f"owns decks {', '.join(str(d + 1) for d in sorted(self.owned))}")
         if self.impair:
             print(f"TEST: impairing the network both ways: {args.impair}")
 
@@ -561,6 +593,10 @@ class Bridge:
         if d[2] == MSG_SPEED:
             if idx < len(DECKS):
                 self.deck_speed[idx] = value
+            return
+        if d[2] == MSG_LOOP:
+            if idx in self.deck_sync:
+                self.deck_sync[idx].loop_len = max(0.0, value)
             return
         if d[2] != MSG_VALUE or idx >= len(CONTROLS):
             return
@@ -605,8 +641,8 @@ class Bridge:
                              playing, self.deck_speed[deck])
         self.last_position[deck] = packet
         self.send(packet)
-        if self.deck_sync and self.clock.synced:
-            sync = self.deck_sync[deck]
+        sync = self.deck_sync.get(deck)
+        if sync and self.clock.synced:
             sync.own_report(t, pos, playing)
             if self.sync_log and sync.last_error is not None:
                 self.sync_log.write(f"{t:.4f},{deck + 1},{sync.last_error * 1000:.3f},"
@@ -669,8 +705,10 @@ class Bridge:
         if idx in PLAY_IDX:
             self.playing[idx] = value > 0.5
         self.send_to_mixxx([SYSEX_ID, TO_MIXXX, MSG_VALUE, idx] + encode_float(value))
-        if idx in DECK_PLAY_IDX and value > 0.5 and self.deck_sync and self.clock.synced:
-            self.deck_sync[DECK_PLAY_IDX.index(idx)].started(ts, self.clock.now())
+        if idx in DECK_PLAY_IDX and value > 0.5 and self.clock.synced:
+            sync = self.deck_sync.get(DECK_PLAY_IDX.index(idx))
+            if sync:
+                sync.started(ts, self.clock.now())
         if self.verbose:
             g, k = CONTROLS[idx]
             late = (self.clock.now() - ts) * 1000
@@ -684,8 +722,9 @@ class Bridge:
             self.on_value(idx, value, ts)
         elif kind == NET_POSITION and len(data) == struct.calcsize(POSITION_FMT):
             _, session, deck, t, pos, playing, speed = struct.unpack(POSITION_FMT, data)
-            if session == self.peer_session and deck < len(self.deck_sync) and self.clock.synced:
-                self.deck_sync[deck].leader_report(t, pos, bool(playing), speed, self.clock.now())
+            sync = self.deck_sync.get(deck)
+            if session == self.peer_session and sync and self.clock.synced:
+                sync.leader_report(t, pos, bool(playing), speed, self.clock.now())
         elif kind == NET_HELLO and len(data) == struct.calcsize("!BI"):
             _, session = struct.unpack("!BI", data)
             self.note_peer(session)
@@ -758,6 +797,7 @@ class Bridge:
                     if now >= next_status:
                         print(f"RTT {s['rtt'] * 1000:.2f} ms  session time {self.clock.now():.3f}  "
                               f"deck positions sent {self.positions_sent}")
+                        self.print_deck_sync()
                         next_status = now + STATUS_INTERVAL
                 elif locked != was_locked or now >= next_status:
                     line = (f"Clock {'LOCKED' if locked else 'syncing'}: "
@@ -771,21 +811,23 @@ class Bridge:
                         true_error = self.clock.now() - time.perf_counter()
                         line += f", TRUE error {true_error * 1000:+.3f} ms"
                     print(line)
-                    for sync in self.deck_sync:
-                        if not self.playing.get(DECK_PLAY_IDX[sync.deck]):
-                            continue
-                        # The report counts show which side is silent when
-                        # sync isn't happening: ours (mapping) or the leader's.
-                        counts = (f"reports: leader {sync.leader_reports}, "
-                                  f"own {sync.own_reports}")
-                        if sync.last_error is None:
-                            print(f"Deck {sync.deck + 1} sync: NOT ACTIVE, {counts}")
-                        else:
-                            print(f"Deck {sync.deck + 1} sync: error {sync.last_error * 1000:+.2f} ms, "
-                                  f"trim {sync.current_trim * 1e6:+.0f} ppm, seeks {sync.seeks}, {counts}")
+                    self.print_deck_sync()
                     next_status = now + STATUS_INTERVAL
                 was_locked = locked
             time.sleep(0.02)
+
+    def print_deck_sync(self):
+        for sync in self.deck_sync.values():
+            if not self.playing.get(DECK_PLAY_IDX[sync.deck]):
+                continue
+            # The report counts show which side is silent when sync isn't
+            # happening: ours (mapping) or the deck owner's.
+            counts = f"reports: owner {sync.leader_reports}, own {sync.own_reports}"
+            if sync.last_error is None:
+                print(f"Deck {sync.deck + 1} sync: NOT ACTIVE, {counts}")
+            else:
+                print(f"Deck {sync.deck + 1} sync: error {sync.last_error * 1000:+.2f} ms, "
+                      f"trim {sync.current_trim * 1e6:+.0f} ppm, seeks {sync.seeks}, {counts}")
 
     def run(self):
         threading.Thread(target=self.recv_loop, daemon=True).start()
@@ -812,8 +854,10 @@ def main():
     p.add_argument("--leader", action="store_true", help="this side's state wins on connect")
     p.add_argument("--verbose", "-v", action="store_true", help="log every control change")
     p.add_argument("--list-ports", action="store_true", help="list MIDI ports and exit")
+    p.add_argument("--own-decks", metavar="LIST",
+                   help="decks whose playhead this side owns, e.g. 1,2 (default: leader 1,2, follower 3,4)")
     p.add_argument("--no-deck-sync", action="store_true",
-                   help="follower: don't correct deck positions (for baseline measurements)")
+                   help="don't correct the other side's decks (for baseline measurements)")
     p.add_argument("--sync-log", metavar="FILE",
                    help="follower: write every deck position error to this CSV file")
     p.add_argument("--clock-log", metavar="FILE",

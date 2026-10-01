@@ -6,7 +6,8 @@
 // SysEx format (all bytes after F0 must be < 0x80):
 //   F0 7D <dir> <type> [<idx> <v0> <v1> <v2> <v3> <v4>] F7
 //   dir:  0x01 = from Mixxx, 0x02 = to Mixxx
-//   type: 0x01 = control value, 0x02 = snapshot request (to Mixxx only)
+//   type: MSG_* below (control value, snapshot request, deck position/speed/loop,
+//         and seek/trim from the bridge)
 //   idx:  index into MixxxCollab.controls (must match collab_bridge.py)
 //   v0-v4: float32 (big-endian bits) packed into 7-bit bytes
 //
@@ -24,42 +25,60 @@ MixxxCollab.MSG_POSITION = 0x03;  // from Mixxx: idx = deck, value = playpositio
 MixxxCollab.MSG_SEEK = 0x04;      // to Mixxx: idx = deck, value = playposition
 MixxxCollab.MSG_TRIM = 0x05;      // to Mixxx: idx = deck, value = relative speed trim
 MixxxCollab.MSG_SPEED = 0x06;     // from Mixxx: idx = deck, value = track fractions per second
+MixxxCollab.MSG_LOOP = 0x07;      // from Mixxx: idx = deck, value = loop length as a track fraction
 MixxxCollab.EPSILON = 1e-4;
 
-// Deck sync: each deck's playposition is reported while it plays, and the
-// follower's bridge answers with seeks and small speed trims to stay on the
-// leader's playhead. Keep in sync with DECKS in collab_bridge.py.
-MixxxCollab.decks = ["[Channel1]", "[Channel2]"];
+// Deck sync: each deck's playposition is reported, and for decks the other
+// machine owns, the bridge answers with seeks and small speed trims to stay
+// on the owner's playhead. Keep in sync with DECKS in collab_bridge.py.
+MixxxCollab.decks = ["[Channel1]", "[Channel2]", "[Channel3]", "[Channel4]"];
 MixxxCollab.POSITION_INTERVAL_MS = 200;
+MixxxCollab.JUMP_SECONDS = 0.1;   // a position change this far off the expected one is a jump
 MixxxCollab.TRIM_ACTIVE_MS = 3000;
-MixxxCollab.lastPositionSent = [0, 0];
-MixxxCollab.trimRatio = [1, 1];   // speed factor currently applied on top of the rate
-MixxxCollab.lastTrim = [0, 0];    // when the bridge last trimmed each deck
-MixxxCollab.quantizeTimer = [0, 0];  // pending "turn quantize back on" timers
+MixxxCollab.lastPositionSent = [];
+MixxxCollab.trimRatio = [];       // speed factor currently applied on top of the rate
+MixxxCollab.lastTrim = [];        // when the bridge last trimmed each deck
+MixxxCollab.quantizeTimer = [];   // pending "turn quantize back on" timers
+for (var d = 0; d < MixxxCollab.decks.length; d++) {
+    MixxxCollab.lastPositionSent.push(0);
+    MixxxCollab.trimRatio.push(1);
+    MixxxCollab.lastTrim.push(0);
+    MixxxCollab.quantizeTimer.push(0);
+}
 
-// ORDER MATTERS — the index is what goes over the wire.
-// Keep in sync with CONTROLS in collab_bridge.py.
-MixxxCollab.controls = [
-    ["[Master]", "crossfader"],
-
-    ["[Channel1]", "play"],
-    ["[Channel1]", "volume"],
-    ["[Channel1]", "pregain"],
-    ["[Channel1]", "rate"],
-    ["[EqualizerRack1_[Channel1]_Effect1]", "parameter1"],  // low
-    ["[EqualizerRack1_[Channel1]_Effect1]", "parameter2"],  // mid
-    ["[EqualizerRack1_[Channel1]_Effect1]", "parameter3"],  // high
-    ["[QuickEffectRack1_[Channel1]]", "super1"],            // filter
-
-    ["[Channel2]", "play"],
-    ["[Channel2]", "volume"],
-    ["[Channel2]", "pregain"],
-    ["[Channel2]", "rate"],
-    ["[EqualizerRack1_[Channel2]_Effect1]", "parameter1"],
-    ["[EqualizerRack1_[Channel2]_Effect1]", "parameter2"],
-    ["[EqualizerRack1_[Channel2]_Effect1]", "parameter3"],
-    ["[QuickEffectRack1_[Channel2]]", "super1"],
-];
+// ORDER MATTERS — the index is what goes over the wire, and must stay under
+// 128. Built the same way as CONTROLS in collab_bridge.py; change both.
+// Which effect or chain preset is loaded travels as an index into Mixxx's
+// effect lists, so it matches only if both machines list the same effects in
+// the same order (true for the same Mixxx version with default settings).
+// Loads come before their parameters, so a snapshot applies them first.
+// Not synced on purpose: headphone cue (pfl), master/headphone gain, quantize
+// and sync lock (the leader's rate is what travels), and momentary buttons
+// such as cue, hotcues and beatjump, whose effect arrives as a position.
+MixxxCollab.controls = [["[Master]", "crossfader"]];
+MixxxCollab.decks.forEach(function(g) {
+    MixxxCollab.controls.push(
+        [g, "play"], [g, "volume"], [g, "pregain"], [g, "rate"], [g, "keylock"],
+        ["[EqualizerRack1_" + g + "_Effect1]", "parameter1"],  // low
+        ["[EqualizerRack1_" + g + "_Effect1]", "parameter2"],  // mid
+        ["[EqualizerRack1_" + g + "_Effect1]", "parameter3"],  // high
+        ["[QuickEffectRack1_" + g + "]", "loaded_chain_preset"],  // which quick effect
+        ["[QuickEffectRack1_" + g + "]", "super1"],             // filter
+        ["[QuickEffectRack1_" + g + "]", "enabled"],
+        [g, "loop_start_position"], [g, "loop_end_position"], [g, "loop_enabled"]);
+});
+[1, 2].forEach(function(u) {
+    var unit = "[EffectRack1_EffectUnit" + u + "]";
+    MixxxCollab.controls.push([unit, "loaded_chain_preset"],
+        [unit, "mix"], [unit, "super1"], [unit, "enabled"]);
+    MixxxCollab.decks.forEach(function(g) {
+        MixxxCollab.controls.push([unit, "group_" + g + "_enable"]);
+    });
+    [1, 2, 3].forEach(function(e) {
+        var effect = "[EffectRack1_EffectUnit" + u + "_Effect" + e + "]";
+        MixxxCollab.controls.push([effect, "loaded_effect"], [effect, "enabled"], [effect, "meta"]);
+    });
+});
 
 // Values recently applied from the network, per control index, as [value, time]
 // pairs, so the resulting change callbacks aren't echoed straight back to the
@@ -136,9 +155,19 @@ MixxxCollab.rememberRemote = function(idx, value) {
 // the next play starts from.
 MixxxCollab.makePositionHandler = function(deck) {
     var group = MixxxCollab.decks[deck];
+    var lastValue = 0;
+    var lastTime = 0;
     return function(value) {
         var now = Date.now();
-        if (engine.getValue(group, "play") &&
+        // A jump (hotcue, cue, beatjump, loop wrap) is reported straight
+        // away, so the other side can follow it without waiting.
+        var duration = engine.getValue(group, "duration");
+        var expected = lastValue + (now - lastTime) / 1000 *
+            engine.getValue(group, "rate_ratio") / (duration || 1);
+        var jumped = duration > 0 && Math.abs(value - expected) * duration > MixxxCollab.JUMP_SECONDS;
+        lastValue = value;
+        lastTime = now;
+        if (!jumped && engine.getValue(group, "play") &&
                 now - MixxxCollab.lastPositionSent[deck] < MixxxCollab.POSITION_INTERVAL_MS) {
             return;
         }
@@ -202,9 +231,27 @@ MixxxCollab.sendSnapshot = function() {
     }
 };
 
+// Tell the bridge the active loop's length, so it can compare playheads
+// around the loop instead of treating every wrap as a jump.
+MixxxCollab.sendLoop = function(deck) {
+    var group = MixxxCollab.decks[deck];
+    var samples = engine.getValue(group, "track_samples");
+    var length = 0;
+    if (engine.getValue(group, "loop_enabled") && samples > 0) {
+        length = (engine.getValue(group, "loop_end_position") -
+            engine.getValue(group, "loop_start_position")) / samples;
+    }
+    MixxxCollab.send(MixxxCollab.MSG_LOOP, deck, Math.max(0, length));
+};
+
 MixxxCollab.makeHandler = function(idx) {
     var playDeck = MixxxCollab.playDeck(idx);
+    var c = MixxxCollab.controls[idx];
+    var loopDeck = c[1].indexOf("loop_") === 0 ? MixxxCollab.decks.indexOf(c[0]) : -1;
     return function(value) {
+        if (loopDeck >= 0) {
+            MixxxCollab.sendLoop(loopDeck);
+        }
         // Play/pause: tell the bridge the speed first and the position after
         // the change, whether it came from here or from the peer, so it knows
         // exactly where this deck started or stopped.
