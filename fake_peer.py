@@ -17,7 +17,7 @@ import threading
 import time
 
 from collab_bridge import (CONTROLS, NET_HELLO, NET_PING, NET_PONG, NET_POSITION, NET_VALUE,
-                           PING_FMT, PONG_FMT, POSITION_FMT)
+                           PING_FMT, PONG_FMT, POSITION_FMT, VALUE_FMT)
 
 CROSSFADER = CONTROLS.index(("[Master]", "crossfader"))
 PLAY_DECK1 = CONTROLS.index(("[Channel1]", "play"))
@@ -49,10 +49,10 @@ def main():
             if not data:
                 continue
             kind = data[0]
-            if kind == NET_VALUE and len(data) == struct.calcsize("!BIIBf"):
-                _, _, seq, idx, value = struct.unpack("!BIIBf", data)
+            if kind == NET_VALUE and len(data) == struct.calcsize(VALUE_FMT):
+                _, _, idx, value, ts = struct.unpack(VALUE_FMT, data)
                 name = ",".join(CONTROLS[idx]) if idx < len(CONTROLS) else f"idx {idx}"
-                print(f"  from Mixxx: {name} = {value:.4f}  (seq {seq})")
+                print(f"  from Mixxx: {name} = {value:.4f}  (changed at {ts:.3f})")
             elif kind == NET_PING and len(data) == struct.calcsize(PING_FMT):
                 _, _, t0 = struct.unpack(PING_FMT, data)
                 now = time.perf_counter()
@@ -60,7 +60,6 @@ def main():
 
     threading.Thread(target=recv_loop, daemon=True).start()
 
-    seq = 0
     last_hello = 0.0
     last_position = 0.0
     start = time.time()
@@ -72,9 +71,9 @@ def main():
                 sock.sendto(struct.pack("!BI", NET_HELLO, session), bridge_addr)
                 last_hello = now
                 if args.lead_seconds:
-                    # Keep deck 1 playing on the follower (newest seq wins).
-                    seq += 1
-                    sock.sendto(struct.pack("!BIIBf", NET_VALUE, session, seq, PLAY_DECK1, 1.0), bridge_addr)
+                    # Keep deck 1 playing on the follower, resent like the bridges resend their state.
+                    sock.sendto(struct.pack(VALUE_FMT, NET_VALUE, session, PLAY_DECK1, 1.0, lead_start),
+                                bridge_addr)
             if args.lead_seconds and now - last_position >= 0.2:
                 # Pretend to be a leader whose deck 1 started at the top of the
                 # track when this script started. Our perf_counter is the
@@ -82,11 +81,12 @@ def main():
                 last_position = now
                 t = time.perf_counter()
                 pos = ((t - lead_start) % args.lead_seconds) / args.lead_seconds
-                sock.sendto(struct.pack(POSITION_FMT, NET_POSITION, session, 0, t, pos), bridge_addr)
+                sock.sendto(struct.pack(POSITION_FMT, NET_POSITION, session, 0, t, pos, 1,
+                                        1.0 / args.lead_seconds), bridge_addr)
             if args.sweep:
-                seq += 1
                 value = math.sin((now - start) * 2 * math.pi / 4.0)  # -1..1 every 4 s
-                sock.sendto(struct.pack("!BIIBf", NET_VALUE, session, seq, CROSSFADER, value), bridge_addr)
+                sock.sendto(struct.pack(VALUE_FMT, NET_VALUE, session, CROSSFADER, value,
+                                        time.perf_counter()), bridge_addr)
             time.sleep(0.05)
     except KeyboardInterrupt:
         print("Stopping")

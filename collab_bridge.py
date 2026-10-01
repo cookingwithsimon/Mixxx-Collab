@@ -15,6 +15,8 @@ the leader pushes its full mixer state so both sides start out matching.
 
 import argparse
 import collections
+import heapq
+import itertools
 import random
 import socket
 import statistics
@@ -56,14 +58,19 @@ MSG_SNAPSHOT_REQUEST = 0x02
 MSG_POSITION = 0x03   # from Mixxx: idx = deck, value = playposition (0..1)
 MSG_SEEK = 0x04       # to Mixxx:   idx = deck, value = playposition to jump to
 MSG_TRIM = 0x05       # to Mixxx:   idx = deck, value = relative speed trim
+MSG_SPEED = 0x06      # from Mixxx: idx = deck, value = playback speed in track fractions per second
 DECKS = ["[Channel1]", "[Channel2]"]   # must match MixxxCollab.decks
 # Control idx of each deck's play button, in deck order.
 DECK_PLAY_IDX = [CONTROLS.index((group, "play")) for group in DECKS]
 
 # UDP protocol
-NET_POSITION = 5  # !BIBdd  type, session, deck, session time, playposition
-POSITION_FMT = "!BIBdd"
-NET_VALUE = 1   # !BIIBf  type, session, seq, idx, value
+# Control values carry the session time of the change. Newest wins on both
+# sides, and each side resends the values it last changed every second, so a
+# lost or late packet repairs itself and a stale one can't undo a newer move.
+NET_VALUE = 1     # !BIBfd   type, session, idx, value, session time of the change
+VALUE_FMT = "!BIBfd"
+NET_POSITION = 5  # !BIBddBd type, session, deck, session time, playposition, playing, speed
+POSITION_FMT = "!BIBddBd"
 NET_HELLO = 2   # !BI     type, session
 NET_PING = 3    # !BId    type, session, t0 (sender's local clock)
 NET_PONG = 4    # !BIddd  type, session, echoed t0, t1 (received), t2 (replied)
@@ -72,6 +79,7 @@ PONG_FMT = "!BIddd"
 
 HELLO_INTERVAL = 1.0
 PEER_TIMEOUT = 5.0
+RESEND_INTERVAL = 1.0     # resend our latest control values and paused positions this often
 
 # Clock sync (see "Clock sync" in the protocol doc). Starting values to tune.
 JOIN_BURST = 8            # pings sent when a peer (re)connects
@@ -91,11 +99,19 @@ LEADER_HISTORY = 3.0      # seconds of leader position reports used to predict i
 JUMP_THRESHOLD = 0.03     # a leader report this far off the prediction means it seeked
 ERROR_MEDIAN = 7          # position errors the correction is based on
 SEEK_THRESHOLD = 0.05     # seek when further out than this; nudge the rate otherwise
-SEEK_LEAD = 0.03          # roughly how long a seek takes to reach Mixxx's engine
+SEEK_LEAD = 0.03          # starting guess for how long a seek takes to reach Mixxx's engine
 SEEK_HOLD = 0.5           # ignore our own position reports this long after seeking
-TRIM_TIME = 4.0           # nudge so the error would close in about this many seconds
+TRIM_TIME = 2.5           # nudge so the error would close in about this many seconds
 MAX_TRIM = 0.005          # never change speed by more than 0.5%
 TRIM_RESEND = 1.0         # resend the trim this often so the mapping knows it's live
+MAX_SEEK_LEAD = 0.3       # bounds for the learned seek lead
+START_MATCH = 0.5         # a leader start anchor this close to the play event belongs to it
+PAUSED_TOLERANCE = 0.02   # while both are paused, line up positions further apart than this
+REFINE_TIME = 4.0         # just after a start, seeks are cheap; for this long...
+REFINE_THRESHOLD = 0.005  # ...seek for errors above this instead of trimming for seconds...
+REFINE_SEEKS = 3          # ...at most this many times
+LATE_START = 0.05         # only jump ahead on play if it reached us at least this late
+MAX_LEAD_STEP = 0.02      # one landing can move the learned seek lead at most this much
 
 
 def encode_float(value):
@@ -114,6 +130,63 @@ def find_port(names, wanted, kind):
             return name
     print(f"No MIDI {kind} port matching '{wanted}'. Available: {names}")
     sys.exit(1)
+
+
+class Impairment:
+    """Testing only: make the network worse on purpose, in both directions.
+
+    Spec is comma-separated, e.g. "delay=20,jitter=10,loss=2,spike=500/20":
+    delay/jitter in ms, loss in percent, and spike=MS/EVERY_S stalls all
+    traffic for MS milliseconds every EVERY_S seconds, then lets it through in
+    a burst, like a Wi-Fi hiccup. Jitter reorders packets too.
+    """
+
+    def __init__(self, spec):
+        self.delay = self.jitter = self.loss = 0.0
+        self.spike_len = self.spike_every = 0.0
+        for part in spec.split(","):
+            key, _, val = part.partition("=")
+            if key == "delay":
+                self.delay = float(val) / 1000
+            elif key == "jitter":
+                self.jitter = float(val) / 1000
+            elif key == "loss":
+                self.loss = float(val) / 100
+            elif key == "spike":
+                length, _, every = val.partition("/")
+                self.spike_len, self.spike_every = float(length) / 1000, float(every)
+            else:
+                raise ValueError(f"unknown impairment '{key}' in '{spec}'")
+        self.heap = []
+        self.order = itertools.count()
+        self.cond = threading.Condition()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def schedule(self, action):
+        """Run action() after this packet's simulated delay, or never if it is lost."""
+        if random.random() < self.loss:
+            return
+        now = time.monotonic()
+        delay = self.delay + random.uniform(0, self.jitter)
+        if self.spike_every:
+            phase = now % self.spike_every
+            if phase < self.spike_len:
+                delay += self.spike_len - phase   # held until the stall ends
+        with self.cond:
+            heapq.heappush(self.heap, (now + delay, next(self.order), action))
+            self.cond.notify()
+
+    def _run(self):
+        while True:
+            with self.cond:
+                while not self.heap:
+                    self.cond.wait()
+                wait = self.heap[0][0] - time.monotonic()
+                if wait > 0:
+                    self.cond.wait(wait)
+                    continue
+                _, _, action = heapq.heappop(self.heap)
+            action()
 
 
 class SessionClock:
@@ -249,6 +322,16 @@ class DeckSync:
         self.seeks = 0
         self.leader_reports = 0
         self.own_reports = 0
+        self.leader_speed = 0.0       # track fractions per second, from the leader's mapping
+        self.leader_paused = None     # (session time, position) while the leader is paused
+        self.start_anchor = None      # (session time, position) where the leader last started
+        self.pending_start = None     # session time of a play we received but haven't anchored
+        self.own_last = None          # (session time, position, playing) of our latest report
+        self.leader_latest = float("-inf")  # newest leader report time seen
+        self.seek_lead = SEEK_LEAD     # learned from where our seeks actually land
+        self.check_landing = False     # next error measurement tells us how a seek landed
+        self.refine_until = 0.0        # session time until which small errors still get a seek
+        self.refine_left = 0
 
     def _predict(self, t):
         """Leader's position and speed (track fraction per second) at session time t."""
@@ -264,9 +347,30 @@ class DeckSync:
             return None
         return p_mean + speed * (t - t_mean), speed
 
-    def leader_report(self, t, pos):
+    def leader_report(self, t, pos, playing, speed, now):
         with self.lock:
             self.leader_reports += 1
+            if speed > 0:
+                self.leader_speed = speed
+            stale = t < self.leader_latest   # overtaken by a newer report (reordered or resent)
+            self.leader_latest = max(self.leader_latest, t)
+            if not playing:
+                if stale:
+                    return
+                self.leader_paused = (t, pos)
+                self.leader.clear()
+                self.errors.clear()
+                self.last_error = None
+                self._align_paused(now)
+                return
+            fresh = not self.leader or t - self.leader[-1][0] > 1.0
+            if not stale and (self.leader_paused is not None or fresh):
+                # First report since the leader pressed play (or since we last
+                # heard from it): where it started.
+                self.start_anchor = (t, pos)
+                self.leader_paused = None
+                self.leader.clear()
+                self._catch_up_start(now)
             predicted = self._predict(t)
             if predicted and abs(pos - predicted[0]) / predicted[1] > JUMP_THRESHOLD:
                 # The leader seeked, looped or restarted: start a new history.
@@ -276,9 +380,65 @@ class DeckSync:
             while t - self.leader[0][0] > LEADER_HISTORY:
                 self.leader.popleft()
 
-    def own_report(self, t, pos):
+    def started(self, t_play, now):
+        """We just applied the leader's play, which it pressed at session time t_play."""
+        with self.lock:
+            self.pending_start = t_play
+            self._catch_up_start(now)
+
+    def _catch_up_start(self, now):
+        # A play that reaches us late would start the deck behind the leader
+        # and leave it to the trims (or a seek a second later) to catch up.
+        # Jump straight to where the leader is by now instead, using the
+        # position it started from. The listener hears a clipped start, never
+        # a misaligned one.
+        if self.pending_start is None or self.start_anchor is None or not self.leader_speed:
+            return
+        t0, pos0 = self.start_anchor
+        if abs(t0 - self.pending_start) > START_MATCH:
+            return
+        self.pending_start = None
+        # Seeks right after a start aren't noticeable, so allow a few quick
+        # ones to settle the deck instead of trimming for seconds.
+        self.refine_until = now + REFINE_TIME
+        self.refine_left = REFINE_SEEKS
+        if now - t0 >= LATE_START:
+            # Jump ahead to where the leader is by now. Seeks issued as a
+            # deck starts land less predictably (seen on the Ally), so this
+            # one doesn't teach us the seek lead; the refinements fix it up.
+            self._seek_to(pos0 + self.leader_speed * (now - t0 + self.seek_lead), now, learn=False)
+
+    def _seek_to(self, target, now, learn=True):
+        self.seek(self.deck, min(max(target, 0.0), 1.0))
+        self.seeks += 1
+        self.errors.clear()
+        self.hold_until = now + SEEK_HOLD
+        self.check_landing = learn
+
+    def _align_paused(self, now):
+        # While both decks are paused, keep them on the same spot, so a pause
+        # that arrived late or a cue press is already lined up for the next
+        # play. Seeking a paused deck is silent.
+        if self.leader_paused is None or self.own_last is None or self.own_last[2]:
+            return
+        if not self.leader_speed or now < self.hold_until:
+            return
+        target = self.leader_paused[1]
+        if abs(self.own_last[1] - target) / self.leader_speed > PAUSED_TOLERANCE:
+            self.seek(self.deck, target)
+            self.seeks += 1
+            self.own_last = (now, target, False)
+            self.hold_until = now + SEEK_HOLD
+
+    def own_report(self, t, pos, playing):
         with self.lock:
             self.own_reports += 1
+            self.own_last = (t, pos, playing)
+            if not playing:
+                self.errors.clear()
+                self.last_error = None
+                self._align_paused(t)
+                return
             if t < self.hold_until:
                 return
             if not self.leader or t - self.leader[-1][0] > 1.0:
@@ -294,12 +454,21 @@ class DeckSync:
                 return
             error = statistics.median(self.errors)
             self.last_error = error
-            if abs(error) > SEEK_THRESHOLD:
-                target = expected + speed * SEEK_LEAD
-                self.seek(self.deck, min(max(target, 0.0), 1.0))
-                self.seeks += 1
-                self.errors.clear()
-                self.hold_until = t + SEEK_HOLD
+            if self.check_landing:
+                # Where the last seek landed tells us how long seeks take to
+                # reach the engine; learn it, half a step at a time.
+                self.check_landing = False
+                step = max(-MAX_LEAD_STEP, min(MAX_LEAD_STEP, error / 2))
+                self.seek_lead = max(0.0, min(MAX_SEEK_LEAD, self.seek_lead - step))
+            refining = t < self.refine_until and self.refine_left > 0
+            if abs(error) > (REFINE_THRESHOLD if refining else SEEK_THRESHOLD):
+                self._seek_to(expected + speed * self.seek_lead, t)
+                if refining:
+                    self.refine_left -= 1
+                else:
+                    # A big jump is like a fresh start: allow refinements again.
+                    self.refine_until = t + REFINE_TIME
+                    self.refine_left = REFINE_SEEKS
                 return
             trim = max(-MAX_TRIM, min(MAX_TRIM, -error / TRIM_TIME))
             if abs(trim - self.current_trim) > 5e-6 or t - self.trim_sent > TRIM_RESEND:
@@ -329,12 +498,17 @@ class Bridge:
         self.sync_log = None
         if args.sync_log:
             self.sync_log = open(args.sync_log, "w")
-            self.sync_log.write("session_time,deck,error_ms,trim_ppm,seeks\n")
+            self.sync_log.write("session_time,deck,error_ms,trim_ppm,seeks,seek_lead_ms\n")
         self.playing = {}  # control idx -> bool, for the play controls
+        # idx -> {"value", "ts": session time if it came from the peer,
+        #         "local": our local time if it came from our Mixxx}
+        self.state = {}
+        self.state_lock = threading.Lock()
+        self.deck_speed = [0.0] * len(DECKS)
+        self.last_position = [None] * len(DECKS)   # last NET_POSITION packet sent, per deck
         self.session = random.getrandbits(32)
-        self.seq = 0
-        self.seq_lock = threading.Lock()
         self.midi_lock = threading.Lock()
+        self.impair = Impairment(args.impair) if args.impair else None
 
         host, port = args.peer.rsplit(":", 1)
         self.peer_addr = (socket.gethostbyname(host), int(port))
@@ -343,7 +517,6 @@ class Bridge:
 
         self.peer_session = None
         self.peer_last_seen = 0.0
-        self.last_seq_by_idx = {}
 
         if args.virtual:
             # Linux/macOS: no loopMIDI, so create the port ourselves. Mixxx
@@ -362,6 +535,14 @@ class Bridge:
         print(f"MIDI: in='{in_name}' out='{out_name}'")
         print(f"UDP:  listening on {args.listen}, peer {self.peer_addr[0]}:{self.peer_addr[1]}")
         print(f"Role: {'LEADER' if self.leader else 'follower'}  session={self.session:08x}")
+        if self.impair:
+            print(f"TEST: impairing the network both ways: {args.impair}")
+
+    def send(self, packet):
+        if self.impair:
+            self.impair.schedule(lambda: self.sock.sendto(packet, self.peer_addr))
+        else:
+            self.sock.sendto(packet, self.peer_addr)
 
     # ---- Mixxx -> network ----
     def on_midi(self, msg):
@@ -377,32 +558,59 @@ class Bridge:
         if d[2] == MSG_POSITION:
             self.on_position(idx, value)
             return
-        if d[2] != MSG_VALUE:
+        if d[2] == MSG_SPEED:
+            if idx < len(DECKS):
+                self.deck_speed[idx] = value
+            return
+        if d[2] != MSG_VALUE or idx >= len(CONTROLS):
             return
         if idx in PLAY_IDX:
             self.playing[idx] = value > 0.5
-        with self.seq_lock:
-            self.seq += 1
-            seq = self.seq
-        self.sock.sendto(struct.pack("!BIIBf", NET_VALUE, self.session, seq, idx, value), self.peer_addr)
-        if self.verbose and idx < len(CONTROLS):
+        with self.state_lock:
+            self.state[idx] = {"value": value, "ts": None, "local": self.clock.local()}
+        self.send_value(idx)
+        if self.verbose:
             g, k = CONTROLS[idx]
             print(f"  -> {g},{k} = {value:.4f}")
+
+    def entry_time(self, entry):
+        """Session time of a state entry. Ours are kept in local time until
+        first sent, then frozen: our clock offset keeps adjusting, and a
+        resend must carry exactly the same time or the peer would take it as
+        a newer change (and, say, re-apply an old pause)."""
+        if entry["ts"] is not None:
+            return entry["ts"]
+        return self.clock.to_session(entry["local"])
+
+    def send_value(self, idx):
+        """Send our latest value for idx, if the latest change was ours."""
+        if not (self.leader or self.clock.synced):
+            return  # our timestamps aren't comparable yet; the resend loop will catch up
+        with self.state_lock:
+            entry = self.state.get(idx)
+            if entry is None or entry["local"] is None:
+                return
+            entry["ts"] = self.entry_time(entry)
+            packet = struct.pack(VALUE_FMT, NET_VALUE, self.session, idx, entry["value"], entry["ts"])
+        self.send(packet)
 
     def on_position(self, deck, pos):
         """Our Mixxx reported a deck's playposition; stamp it with session time."""
         if deck >= len(DECKS):
             return
         t = self.clock.now()
+        playing = bool(self.playing.get(DECK_PLAY_IDX[deck]))
         self.positions_sent += 1
-        self.sock.sendto(struct.pack(POSITION_FMT, NET_POSITION, self.session, deck, t, pos),
-                         self.peer_addr)
+        packet = struct.pack(POSITION_FMT, NET_POSITION, self.session, deck, t, pos,
+                             playing, self.deck_speed[deck])
+        self.last_position[deck] = packet
+        self.send(packet)
         if self.deck_sync and self.clock.synced:
             sync = self.deck_sync[deck]
-            sync.own_report(t, pos)
+            sync.own_report(t, pos, playing)
             if self.sync_log and sync.last_error is not None:
                 self.sync_log.write(f"{t:.4f},{deck + 1},{sync.last_error * 1000:.3f},"
-                                    f"{sync.current_trim * 1e6:.1f},{sync.seeks}\n")
+                                    f"{sync.current_trim * 1e6:.1f},{sync.seeks},{sync.seek_lead * 1000:.1f}\n")
                 self.sync_log.flush()
 
     # ---- network -> Mixxx ----
@@ -427,7 +635,6 @@ class Bridge:
         self.peer_last_seen = now
         if new_session:
             self.peer_session = session
-            self.last_seq_by_idx.clear()
         if new_session or not was_connected:
             print(f"Peer connected (session={session:08x})")
             self.clock.reset()
@@ -442,47 +649,62 @@ class Bridge:
                 data, addr = self.sock.recvfrom(64)
             except ConnectionResetError:
                 continue  # Windows raises this for ICMP port-unreachable; ignore
-            received = self.clock.local()
             if not data or addr != self.peer_addr:
                 continue  # only the configured peer may drive this Mixxx
-            kind = data[0]
-            if kind == NET_VALUE and len(data) == struct.calcsize("!BIIBf"):
-                _, session, seq, idx, value = struct.unpack("!BIIBf", data)
-                self.note_peer(session)
-                if seq <= self.last_seq_by_idx.get(idx, 0):
-                    continue  # out-of-order / stale
-                self.last_seq_by_idx[idx] = seq
-                if idx in PLAY_IDX:
-                    self.playing[idx] = value > 0.5
-                self.send_to_mixxx([SYSEX_ID, TO_MIXXX, MSG_VALUE, idx] + encode_float(value))
-                if self.verbose and idx < len(CONTROLS):
-                    g, k = CONTROLS[idx]
-                    print(f"  <- {g},{k} = {value:.4f}")
-            elif kind == NET_POSITION and len(data) == struct.calcsize(POSITION_FMT):
-                _, session, deck, t, pos = struct.unpack(POSITION_FMT, data)
-                if session == self.peer_session and deck < len(self.deck_sync):
-                    self.deck_sync[deck].leader_report(t, pos)
-            elif kind == NET_HELLO and len(data) == struct.calcsize("!BI"):
-                _, session = struct.unpack("!BI", data)
-                self.note_peer(session)
-            elif kind == NET_PING and len(data) == struct.calcsize(PING_FMT):
-                _, session, t0 = struct.unpack(PING_FMT, data)
-                self.note_peer(session)
-                t1 = self.clock.to_session(received)
-                self.sock.sendto(
-                    struct.pack(PONG_FMT, NET_PONG, self.session, t0, t1, self.clock.now()),
-                    self.peer_addr)
-            elif kind == NET_PONG and len(data) == struct.calcsize(PONG_FMT):
-                _, session, t0, t1, t2 = struct.unpack(PONG_FMT, data)
-                if session != self.peer_session or t0 not in self.pending_pings:
-                    continue  # not an answer to one of our pings
-                self.pending_pings.discard(t0)
-                rtt = self.clock.add_sample(t0, t1, t2, received)
-                if self.clock_log:
-                    raw_offset = ((t1 - t0) + (t2 - received)) / 2
-                    self.clock_log.write(f"{received:.6f},{rtt:.6f},{raw_offset:.6f},"
-                                         f"{self.clock.offset:.6f},{self.clock.drift:.9f}\n")
-                    self.clock_log.flush()
+            if self.impair:
+                # Arrival time is taken when the impaired packet is delivered.
+                self.impair.schedule(lambda d=data: self.handle_packet(d, self.clock.local()))
+            else:
+                self.handle_packet(data, self.clock.local())
+
+    def on_value(self, idx, value, ts):
+        """A control value from the peer, changed at session time ts."""
+        if idx >= len(CONTROLS):
+            return
+        with self.state_lock:
+            entry = self.state.get(idx)
+            if entry is not None and ts <= self.entry_time(entry):
+                return  # we already have this change, or a newer one
+            self.state[idx] = {"value": value, "ts": ts, "local": None}
+        if idx in PLAY_IDX:
+            self.playing[idx] = value > 0.5
+        self.send_to_mixxx([SYSEX_ID, TO_MIXXX, MSG_VALUE, idx] + encode_float(value))
+        if idx in DECK_PLAY_IDX and value > 0.5 and self.deck_sync and self.clock.synced:
+            self.deck_sync[DECK_PLAY_IDX.index(idx)].started(ts, self.clock.now())
+        if self.verbose:
+            g, k = CONTROLS[idx]
+            late = (self.clock.now() - ts) * 1000
+            print(f"  <- {g},{k} = {value:.4f}" + (f"  ({late:.0f} ms late)" if late > 50 else ""))
+
+    def handle_packet(self, data, received):
+        kind = data[0]
+        if kind == NET_VALUE and len(data) == struct.calcsize(VALUE_FMT):
+            _, session, idx, value, ts = struct.unpack(VALUE_FMT, data)
+            self.note_peer(session)
+            self.on_value(idx, value, ts)
+        elif kind == NET_POSITION and len(data) == struct.calcsize(POSITION_FMT):
+            _, session, deck, t, pos, playing, speed = struct.unpack(POSITION_FMT, data)
+            if session == self.peer_session and deck < len(self.deck_sync) and self.clock.synced:
+                self.deck_sync[deck].leader_report(t, pos, bool(playing), speed, self.clock.now())
+        elif kind == NET_HELLO and len(data) == struct.calcsize("!BI"):
+            _, session = struct.unpack("!BI", data)
+            self.note_peer(session)
+        elif kind == NET_PING and len(data) == struct.calcsize(PING_FMT):
+            _, session, t0 = struct.unpack(PING_FMT, data)
+            self.note_peer(session)
+            t1 = self.clock.to_session(received)
+            self.send(struct.pack(PONG_FMT, NET_PONG, self.session, t0, t1, self.clock.now()))
+        elif kind == NET_PONG and len(data) == struct.calcsize(PONG_FMT):
+            _, session, t0, t1, t2 = struct.unpack(PONG_FMT, data)
+            if session != self.peer_session or t0 not in self.pending_pings:
+                return  # not an answer to one of our pings
+            self.pending_pings.discard(t0)
+            rtt = self.clock.add_sample(t0, t1, t2, received)
+            if self.clock_log:
+                raw_offset = ((t1 - t0) + (t2 - received)) / 2
+                self.clock_log.write(f"{received:.6f},{rtt:.6f},{raw_offset:.6f},"
+                                     f"{self.clock.offset:.6f},{self.clock.drift:.9f}\n")
+                self.clock_log.flush()
 
     def connected(self):
         return self.peer_session is not None and time.time() - self.peer_last_seen < PEER_TIMEOUT
@@ -490,12 +712,25 @@ class Bridge:
     def hello_loop(self):
         was_connected = False
         while True:
-            self.sock.sendto(struct.pack("!BI", NET_HELLO, self.session), self.peer_addr)
+            self.send(struct.pack("!BI", NET_HELLO, self.session))
             connected = self.connected()
             if was_connected and not connected:
                 print("Peer lost")
             was_connected = connected
-            time.sleep(HELLO_INTERVAL)
+            if connected:
+                self.resend()
+            time.sleep(min(HELLO_INTERVAL, RESEND_INTERVAL))
+
+    def resend(self):
+        """Repeat what the peer might have missed: our latest control values,
+        and where each paused deck sits (playing decks report continuously)."""
+        with self.state_lock:
+            ours = [idx for idx, entry in self.state.items() if entry["local"] is not None]
+        for idx in ours:
+            self.send_value(idx)
+        for deck, packet in enumerate(self.last_position):
+            if packet is not None and not self.playing.get(DECK_PLAY_IDX[deck]):
+                self.send(packet)
 
     def clock_loop(self):
         next_ping = 0.0
@@ -508,7 +743,7 @@ class Bridge:
                 if len(self.pending_pings) > 64:
                     self.pending_pings.clear()  # unanswered pings; forget them
                 self.pending_pings.add(t0)
-                self.sock.sendto(struct.pack(PING_FMT, NET_PING, self.session, t0), self.peer_addr)
+                self.send(struct.pack(PING_FMT, NET_PING, self.session, t0))
                 if self.burst_left > 0:
                     self.burst_left -= 1
                     next_ping = now + BURST_INTERVAL
@@ -583,6 +818,9 @@ def main():
                    help="follower: write every deck position error to this CSV file")
     p.add_argument("--clock-log", metavar="FILE",
                    help="write every clock sync sample to this CSV file, for tuning the filter")
+    p.add_argument("--impair", metavar="SPEC",
+                   help='testing only: degrade the network both ways, e.g. "delay=20,jitter=10,'
+                        'loss=2,spike=500/20" (ms, ms, percent, stall ms / every s)')
     p.add_argument("--test-clock-skew", type=float, default=0.0, metavar="SECONDS",
                    help="testing only: shift this machine's clock by this much")
     p.add_argument("--test-clock-drift", type=float, default=0.0, metavar="PPM",

@@ -23,6 +23,7 @@ MixxxCollab.MSG_SNAPSHOT_REQUEST = 0x02;
 MixxxCollab.MSG_POSITION = 0x03;  // from Mixxx: idx = deck, value = playposition
 MixxxCollab.MSG_SEEK = 0x04;      // to Mixxx: idx = deck, value = playposition
 MixxxCollab.MSG_TRIM = 0x05;      // to Mixxx: idx = deck, value = relative speed trim
+MixxxCollab.MSG_SPEED = 0x06;     // from Mixxx: idx = deck, value = track fractions per second
 MixxxCollab.EPSILON = 1e-4;
 
 // Deck sync: each deck's playposition is reported while it plays, and the
@@ -130,17 +131,41 @@ MixxxCollab.rememberRemote = function(idx, value) {
     MixxxCollab.recentRemote[idx].push([value, Date.now()]);
 };
 
+// Position reports: a few per second while playing; every change while
+// paused (cue presses, seeks, loads), since where a paused deck sits is what
+// the next play starts from.
 MixxxCollab.makePositionHandler = function(deck) {
     var group = MixxxCollab.decks[deck];
     return function(value) {
         var now = Date.now();
-        if (now - MixxxCollab.lastPositionSent[deck] < MixxxCollab.POSITION_INTERVAL_MS ||
-                !engine.getValue(group, "play")) {
+        if (engine.getValue(group, "play") &&
+                now - MixxxCollab.lastPositionSent[deck] < MixxxCollab.POSITION_INTERVAL_MS) {
             return;
         }
         MixxxCollab.lastPositionSent[deck] = now;
         MixxxCollab.send(MixxxCollab.MSG_POSITION, deck, value);
     };
+};
+
+MixxxCollab.sendPositionNow = function(deck) {
+    MixxxCollab.lastPositionSent[deck] = Date.now();
+    MixxxCollab.send(MixxxCollab.MSG_POSITION, deck,
+        engine.getValue(MixxxCollab.decks[deck], "playposition"));
+};
+
+// How fast the deck moves through the track, so a late play can be placed.
+MixxxCollab.sendSpeed = function(deck) {
+    var group = MixxxCollab.decks[deck];
+    var duration = engine.getValue(group, "duration");
+    if (duration > 0) {
+        MixxxCollab.send(MixxxCollab.MSG_SPEED, deck, engine.getValue(group, "rate_ratio") / duration);
+    }
+};
+
+// Deck number (0-based) if control idx is a synced deck's play button, else -1.
+MixxxCollab.playDeck = function(idx) {
+    var c = MixxxCollab.controls[idx];
+    return c[1] === "play" ? MixxxCollab.decks.indexOf(c[0]) : -1;
 };
 
 // Seek to an exact position. With quantize on, Mixxx keeps the beat phase when
@@ -178,21 +203,34 @@ MixxxCollab.sendSnapshot = function() {
 };
 
 MixxxCollab.makeHandler = function(idx) {
+    var playDeck = MixxxCollab.playDeck(idx);
     return function(value) {
-        if (MixxxCollab.isRemoteEcho(idx, value)) {
-            return;  // this change came from the peer; don't echo it
+        // Play/pause: tell the bridge the speed first and the position after
+        // the change, whether it came from here or from the peer, so it knows
+        // exactly where this deck started or stopped.
+        if (playDeck >= 0) {
+            MixxxCollab.sendSpeed(playDeck);
         }
-        var deck = MixxxCollab.rateDeck(idx);
-        if (deck >= 0 && Date.now() - MixxxCollab.lastTrim[deck] < MixxxCollab.TRIM_ACTIVE_MS) {
-            // This deck is being trimmed to follow the peer, so its rate
-            // belongs to the peer; the change we see is our own trim.
-            return;
+        if (!MixxxCollab.isRemoteEcho(idx, value)) {  // else it came from the peer
+            MixxxCollab.sendLocalChange(idx, value);
         }
-        if (deck >= 0) {
-            MixxxCollab.trimRatio[deck] = 1;  // a local pitch change overwrote any old trim
+        if (playDeck >= 0) {
+            MixxxCollab.sendPositionNow(playDeck);
         }
-        MixxxCollab.sendValue(idx, value);
     };
+};
+
+MixxxCollab.sendLocalChange = function(idx, value) {
+    var deck = MixxxCollab.rateDeck(idx);
+    if (deck >= 0 && Date.now() - MixxxCollab.lastTrim[deck] < MixxxCollab.TRIM_ACTIVE_MS) {
+        // This deck is being trimmed to follow the peer, so its rate
+        // belongs to the peer; the change we see is our own trim.
+        return;
+    }
+    if (deck >= 0) {
+        MixxxCollab.trimRatio[deck] = 1;  // a local pitch change overwrote any old trim
+    }
+    MixxxCollab.sendValue(idx, value);
 };
 
 MixxxCollab.init = function(id, debugging) {

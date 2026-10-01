@@ -40,9 +40,23 @@ the mapping into Mixxx (native and Flatpak installs).
 
 ## Status
 
-Control replication on a LAN works for the crossfader and, on decks 1 and 2, play,
-volume, gain, rate, 3-band EQ and filter. There is no shared clock yet, so decks
-are not phase-aligned.
+Working on a LAN and over Wi-Fi between Windows and SteamOS:
+
+- Mixer controls (crossfader; play, volume, gain, rate, EQ and filter on decks 1
+  and 2) mirror both ways. Every change carries its session time, the newest
+  wins, and each side resends its latest values every second, so lost or late
+  packets repair themselves.
+- A shared session clock (ping-pong with drift tracking) and deck sync: the
+  follower keeps each deck on the leader's playhead with seeks and small speed
+  trims. In tests with a 600 ms stall every 7 s and 5% loss, steady playback
+  stayed within 5 ms; starts settle within a few seconds.
+
+Testing tools: `--impair` on the bridge degrades the network on purpose,
+`simulate.py` runs two bridges against simulated decks, and `make_click_track.py`
+plus `measure_sync.py` measure real machines through a line-in.
+
+Not yet: decks 3 and 4, cue/loops/hotcues, compensation for each machine's
+output latency, internet play (NAT traversal), and file sync.
 
 ## License
 
