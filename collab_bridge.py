@@ -102,6 +102,7 @@ PEER_TIMEOUT = 5.0
 RESEND_INTERVAL = 1.0     # resend our latest control values and paused positions this often
 PUNCH_INTERVAL = 0.25     # while not connected, say hello to every candidate address this often
 STUN_INTERVAL = 20.0      # refresh our public address (and keep the router's mapping open)
+CONNECT_HINT_AFTER = 15.0  # explain what to try if an internet session hasn't connected by then
 SESSION_FILE = os.path.join(os.path.expanduser("~"), ".mixxxcollab", "session.json")
 
 # Clock sync (see "Clock sync" in the protocol doc). Starting values to tune.
@@ -603,6 +604,8 @@ class Bridge:
         self.peer_addr = self.candidates[0] if self.candidates else None
         self.public_addr = None
         self.stun_txns = {}
+        self.stun_seen = {}            # STUN server -> the public address it saw us at
+        self.strict_warned = False
         self.upnp = None
 
         self.peer_session = None
@@ -665,12 +668,37 @@ class Bridge:
         for txn in list(self.stun_txns):
             addr = nat.parse_stun_response(data, txn)
             if addr:
-                del self.stun_txns[txn]
+                server = self.stun_txns.pop(txn)
+                self.stun_seen[server] = addr
+                self.check_strict_nat()
                 if addr != self.public_addr:
                     if self.public_addr:
                         print(f"Our public address changed to {addr[0]}:{addr[1]}")
                     self.public_addr = addr
                 return
+
+    def check_strict_nat(self):
+        """Two STUN servers seeing us at different public ports means our
+        router (or mobile network) picks a new port for every destination.
+        Then the port in our codes is only right for the STUN server, and a
+        direct connection only works if the other side's port is open."""
+        ports = {addr for addr in self.stun_seen.values()}
+        if len(ports) > 1 and not self.strict_warned:
+            self.strict_warned = True
+            seen = ", ".join(f"{ip}:{port}" for ip, port in sorted(ports))
+            print("\nNOTE: this network is a strict one (it shows a different public port to each\n"
+                  f"      server: {seen}; common on mobile data). Connecting will only work if the\n"
+                  "      other side's port is open: the leader can forward a UDP port on its\n"
+                  "      router and start with --listen <port> (see the README).\n")
+
+    def connect_hint(self):
+        if self.leader:
+            return ("Not connected yet. If the partner's reply code hasn't been used, paste it now. If it\n"
+                    "  has, one of the two networks is probably strict: forward a UDP port on this router\n"
+                    f"  to this machine, restart with --invite --listen <port>, and send the new invite.")
+        return ("Not connected yet. Send the reply code above to the leader if you haven't. If you have,\n"
+                "  one of the two networks is probably strict: ask the leader to forward a UDP port on\n"
+                "  their router and send a new invite (see the README).")
 
     def wait_for_public_address(self, timeout=3.0):
         self.stun()
@@ -1005,6 +1033,8 @@ class Bridge:
     def hello_loop(self):
         was_connected = False
         last_hello = last_stun = 0.0
+        trying_since = time.time()       # when we started (or went back to) trying to connect
+        hinted = False
         while True:
             now = time.time()
             connected = self.connected()
@@ -1018,6 +1048,11 @@ class Bridge:
             if self.secret and now - last_stun >= STUN_INTERVAL:
                 self.stun()
                 last_stun = now
+            if connected:
+                trying_since, hinted = now, False
+            elif self.secret and not hinted and now - trying_since > CONNECT_HINT_AFTER:
+                print(self.connect_hint())
+                hinted = True
             if was_connected and not connected:
                 print("Peer lost; trying to reach it again")
             was_connected = connected
