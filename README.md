@@ -43,8 +43,15 @@ public STUN server, the leader asks its router to forward the port (UPnP)
 where it can, and both send to each other's public and local addresses until
 one gets through. Every packet is signed with a secret from the invite code,
 so nobody else can drive your Mixxx. `--resume` reconnects the last session
-without new codes. Very strict routers (some mobile networks) may still need
-a relay, which isn't built yet.
+without new codes.
+
+If the two never connect, one side is probably on a strict network (common on
+mobile data) and the leader's router doesn't do UPnP. Forward one UDP port on
+the leader's router to the leader's machine and start the leader with
+`--listen <that port>`; the partner can then connect from any network. Every
+packet is signed, so the open port only answers to your partner. (Tested: a
+ROG Ally on a phone hotspot joining through a forwarded port, about 26 ms
+round trip.) A relay for when neither side can forward a port isn't built yet.
 
 ## Linux
 
