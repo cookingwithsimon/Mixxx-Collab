@@ -72,38 +72,53 @@ from a Flatpak Mixxx.
 
 ## Status
 
-Working on a LAN and over Wi-Fi between Windows and SteamOS:
+Working between Windows and SteamOS, on a home network and over the internet
+(tested with a ROG Ally on a phone hotspot joining a Windows PC through a
+forwarded port, about 26 ms round trip):
 
-- Controls mirror both ways: crossfader; on all four decks play, volume, gain,
-  rate, keylock, 3-band EQ, quick effect (filter) and loops; and effect units 1
-  and 2 (chain preset, mix, meta knob, on/off, deck assignment, and each slot's
-  effect, on/off and meta). Every change carries its session time, the newest wins, and each side
-  resends its latest values every second, so lost or late packets repair
-  themselves. Cue, hotcues and beatjump aren't sent as buttons; the jump they
-  cause is followed as a position change.
-- Each deck has an owner (by default the leader owns decks 1 and 2, the
-  follower 3 and 4; `--own-decks` changes it) whose playhead the other side
-  follows.
-- A shared session clock (ping-pong with drift tracking) and deck sync: the
-  follower keeps each deck on the leader's playhead with seeks and small speed
-  trims. In tests with a 600 ms stall every 7 s and 5% loss, steady playback
-  stayed within 5 ms; starts settle within a few seconds.
+- **Controls** mirror both ways: crossfader; on all four decks play, volume,
+  gain, rate, keylock, 3-band EQ, quick effect (preset, knob, on/off) and loops;
+  and effect units 1 and 2 (chain preset, mix, meta knob, on/off, deck
+  assignment, and each slot's effect, on/off and meta). Every change carries its
+  session time, the newest wins, and each side resends its latest values every
+  second, so lost or late packets repair themselves. Cue, hotcues and beatjump
+  aren't sent as buttons; the jump they cause is followed as a position change.
+- **Deck ownership:** each deck has an owner (by default the leader owns decks
+  1 and 2, the follower 3 and 4; `--own-decks` changes it) whose playhead the
+  other side follows.
+- **Shared clock and deck sync:** a session clock (ping-pong with drift
+  tracking) and seeks plus small speed trims keep followed decks on the owner's
+  playhead. In tests with a 600 ms stall every 7 s and 5% packet loss, steady
+  playback stayed within 5 ms and starts settled within a few seconds. Followed
+  decks keep Mixxx's quantize off (it fought the sync), and a newly loaded deck
+  is left alone for a moment while Mixxx moves it to its cue point.
+- **Track loading:** loading a file from the shared music folder on either side
+  loads the same file on the other, with paths relative to each machine's
+  `--library` folder. Deck sync pauses on a deck whose two tracks differ. This
+  needs the MixxxCollab build of Mixxx on both machines: the `collab` branch of
+  [Mixxx-Collab-fork](https://github.com/cookingwithsimon/Mixxx-Collab-fork),
+  which adds two scripting calls (`mixxx-collab.patch` here). Windows builds with
+  that repository's `build_collab.bat`; Linux and SteamOS with `build_linux.sh`.
+  Stock Mixxx still syncs everything except track loading.
+- **Internet sessions:** invite and reply codes, signed packets, STUN, optional
+  UPnP, `--resume`, a warning on strict networks, and port forwarding as the
+  fallback (see Internet sessions above).
 
-- Track loading (needs the MixxxCollab build of Mixxx on both machines, from
-  the `collab` branch of the Mixxx fork, which adds two scripting calls):
-  loading a file from the shared music folder on either side loads the same
-  file on the other. Start each bridge with `--library <that machine's path to
-  the shared folder>`; paths travel relative to it. Deck sync pauses on a deck
-  whose two tracks differ.
+In progress: copying a track the partner loaded but this machine doesn't have
+(file sync over the same link, checked by SHA-256).
+
+Not yet: a relay for when neither side can forward a port; the session panel
+with handoff buttons (designed in the integration plan); the control token for
+the crossfader and master (both DJs can move them, and the last move wins);
+compensation for each machine's output latency, which only matters if both
+machines' audio is heard together.
+
+Effect and chain preset choices travel as positions in Mixxx's effect lists, so
+both machines need the same effects listed in the same order (the default).
 
 Testing tools: `--impair` on the bridge degrades the network on purpose,
 `simulate.py` runs two bridges against simulated decks, and `make_click_track.py`
 plus `measure_sync.py` measure real machines through a line-in.
-
-Not yet: a Linux build of the Mixxx fork (stock Mixxx still syncs everything
-except track loading), compensation for each machine's output latency, internet play (NAT traversal), and file sync.
-Effect and chain preset choices travel as positions in Mixxx's effect lists, so
-both machines need the same effects listed in the same order (the default).
 
 ## License
 
