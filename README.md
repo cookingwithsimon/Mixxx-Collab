@@ -44,8 +44,8 @@ Working on a LAN and over Wi-Fi between Windows and SteamOS:
 
 - Controls mirror both ways: crossfader; on all four decks play, volume, gain,
   rate, keylock, 3-band EQ, quick effect (filter) and loops; and effect units 1
-  and 2 (mix, meta knob, on/off, deck assignment, each effect's on/off and
-  meta). Every change carries its session time, the newest wins, and each side
+  and 2 (chain preset, mix, meta knob, on/off, deck assignment, and each slot's
+  effect, on/off and meta). Every change carries its session time, the newest wins, and each side
   resends its latest values every second, so lost or late packets repair
   themselves. Cue, hotcues and beatjump aren't sent as buttons; the jump they
   cause is followed as a position change.
@@ -63,7 +63,8 @@ plus `measure_sync.py` measure real machines through a line-in.
 
 Not yet: loading tracks (load the same file on both sides by hand), compensation
 for each machine's output latency, internet play (NAT traversal), and file sync.
-Effect units only match if both machines have the same effects loaded.
+Effect and chain preset choices travel as positions in Mixxx's effect lists, so
+both machines need the same effects listed in the same order (the default).
 
 ## License
 
