@@ -617,6 +617,7 @@ class Bridge:
         self.public_addr = None
         self.stun_txns = {}
         self.stun_seen = {}            # STUN server -> the public address it saw us at
+        self.stun_primary = None
         self.strict_warned = False
         self.upnp = None
 
@@ -681,11 +682,17 @@ class Bridge:
             addr = nat.parse_stun_response(data, txn)
             if addr:
                 server = self.stun_txns.pop(txn)
+                before = self.stun_seen.get(server)
                 self.stun_seen[server] = addr
                 self.check_strict_nat()
-                if addr != self.public_addr:
-                    if self.public_addr:
-                        print(f"Our public address changed to {addr[0]}:{addr[1]}")
+                # On a strict network each STUN server sees a different port,
+                # so compare like with like: only a change seen by the same
+                # server is a real change, and our address in codes is the
+                # one the first server to answer saw.
+                if before is not None and addr != before:
+                    print(f"Our public address changed to {addr[0]}:{addr[1]}")
+                if self.public_addr is None or server == self.stun_primary:
+                    self.stun_primary = server
                     self.public_addr = addr
                 return
 

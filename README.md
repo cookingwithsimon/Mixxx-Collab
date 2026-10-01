@@ -100,14 +100,19 @@ forwarded port, about 26 ms round trip):
   which adds two scripting calls (`mixxx-collab.patch` here). Windows builds with
   that repository's `build_collab.bat`; Linux and SteamOS with `build_linux.sh`.
   Stock Mixxx still syncs everything except track loading.
+- **File sync:** when the partner loads a track this machine doesn't have, the
+  bridge fetches it over the same signed link, checks it against the sender's
+  SHA-256, puts it in the music folder and loads it (a 10 MB track took about
+  10 s to a phone hotspot). Uploads are capped by `--file-rate` (default
+  10 Mbit/s), halved while a deck plays. Only tracks that get loaded are
+  copied; there's no full-library sync yet.
 - **Internet sessions:** invite and reply codes, signed packets, STUN, optional
   UPnP, `--resume`, a warning on strict networks, and port forwarding as the
   fallback (see Internet sessions above).
 
-In progress: copying a track the partner loaded but this machine doesn't have
-(file sync over the same link, checked by SHA-256).
 
-Not yet: a relay for when neither side can forward a port; the session panel
+Not yet: copying the whole library ahead of a session; a relay for when
+neither side can forward a port; the session panel
 with handoff buttons (designed in the integration plan); the control token for
 the crossfader and master (both DJs can move them, and the last move wins);
 compensation for each machine's output latency, which only matters if both
