@@ -108,6 +108,42 @@ The controller stays a local device that moves local controls, and the module re
 
 Testing should start with one common MIDI controller on each side, then add a second model to check that nothing in the module assumes a particular mapping.
 
+## Session panel
+
+A small, always-visible panel shows the state of the session and holds the handoff buttons, so neither DJ needs a terminal or settings screen during a set.
+
+### Indicators
+
+| Indicator | Shows |
+| --- | --- |
+| Partner | Name, and online, reconnecting or offline; offline shows how long ago the last packet arrived |
+| Link | Round trip in ms and a quality light: green under 30 ms with no recent loss, amber above that or with recent stalls, red when offline |
+| Clock | Locked or syncing; while syncing, the partner's changes still apply but deck sync waits |
+| Role | Whether this machine is the session leader |
+| Crossfader and master | Who holds the control token: "You" or the partner's name |
+| Each deck | Owner ("Yours" or the partner's name), and sync state: in sync, correcting, paused, different track, or missing on this machine |
+
+### Buttons
+
+| Button | Shown when | Effect |
+| --- | --- | --- |
+| Hand over | You hold the token | Sends `HANDOVER`; the button shows "Waiting…" until the partner acknowledges, then the token indicator changes on both screens |
+| Take control | The partner holds the token | Sends `TAKE`; the leader arbitrates, so if both press at once one wins and the other sees "Partner kept control" |
+| Give deck / Take deck | Per deck, in a small menu | Moves deck ownership, and with it whose playhead is authoritative; asks the other DJ to confirm, because their deck may jump |
+| Make me leader | Behind a confirmation | Leader handover, for when the leader's machine is about to leave the session |
+
+Every handoff also appears on the other DJ's panel as a short notice, for example "Partner took the crossfader", so a change is never silent. After taking the token, soft takeover holds the crossfader until the new holder's physical fader passes its current position, as described in the protocol spec.
+
+### Where it lives
+
+| Option | For | Against |
+| --- | --- | --- |
+| A panel served by the companion app (a small local web page or native window) | Works with stock Mixxx and every skin; no change to the fork; fastest to build | A separate window to place next to Mixxx |
+| Widgets in Mixxx's skins | Sits inside Mixxx | Needs new controls in the fork and edits to each skin, which makes the fork thicker |
+| Controller buttons and LEDs | Hands stay on the hardware | Specific to each mapping; only controllers with spare buttons |
+
+Start with the companion app's panel. Where a controller mapping has a spare button and LED, mirror "Take control" and the token indicator onto it, so the most common handoff doesn't need the screen.
+
 ## Milestones
 
 Six stages, each ending in a check that can be run, ordered so the riskiest unknown (timing over the internet) is tested before the polish.
@@ -119,7 +155,7 @@ Six stages, each ending in a check that can be run, ordered so the riskiest unkn
 | M2 Shared clock | Ping-pong sync and a networked internal clock driving Sync Lock | Decks on two machines stay within 5 ms over 10 minutes, measured by recording both outputs playing a click track |
 | M3 Internet play | NAT traversal with UPnP and the invite-code fallback, jitter margin and heartbeats | A 30-minute session across two home connections with no audible drift or dropouts |
 | M4 Files and analysis | Shared-folder sync and shared beatgrids | A file dropped into the folder on one machine arrives on the other, hash-verified, and both sides show identical beat positions |
-| M5 Controllers and resilience | Two controller models, control token handoff, leader handover and reconnect | A session survives a 10-second network drop and resumes without a restart |
+| M5 Controllers and resilience | Two controller models, control token handoff, leader handover, reconnect and the session panel | A session survives a 10-second network drop and resumes without a restart, and the token changes hands from the panel on either machine |
 
 ## Licensing and risks
 

@@ -125,7 +125,7 @@ Every control has one writer at a time, so nothing needs conflict resolution and
 - **Take control:** the other DJ presses a button and sends `TAKE`. The leader arbitrates, so simultaneous presses have one winner, and grants it immediately.
 - **Epoch:** every transfer increments a token epoch. Shared-mixer events from an older epoch are dropped, so a late move from the previous holder can never fight the new one.
 - **No jump on takeover:** the new holder's physical crossfader may sit elsewhere, so soft takeover, which Mixxx mappings can enable, holds the value until the fader passes it.
-- Both actions are on-screen buttons and can be mapped to a spare controller button.
+- Both actions are buttons on the session panel (see the integration plan) and can be mapped to a spare controller button.
 
 ### Lockstep for the shared mixer
 
