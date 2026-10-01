@@ -17,7 +17,7 @@ if (-not (Test-Path "C:\Program Files\Mixxx\mixxx.exe")) {
 
 $venv = "$env:USERPROFILE\.mixxxcollab\venv"
 & "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe" -m venv $venv
-& "$venv\Scripts\python.exe" -m pip install --quiet --disable-pip-version-check --only-binary=:all: mido python-rtmidi
+& "$venv\Scripts\python.exe" -m pip install --quiet --disable-pip-version-check --only-binary=:all: mido python-rtmidi numpy PyAudioWPatch
 
 # loopMIDI keeps its ports in the registry; it must be restarted to pick this up.
 $loopMidi = "C:\Program Files (x86)\Tobias Erichsen\loopMIDI\loopMIDI.exe"

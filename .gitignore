@@ -1,3 +1,6 @@
 .venv/
 .vs/
 __pycache__/
+*.wav
+sync.csv
+sync_*.wav

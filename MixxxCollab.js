@@ -20,7 +20,21 @@ MixxxCollab.FROM_MIXXX = 0x01;
 MixxxCollab.TO_MIXXX = 0x02;
 MixxxCollab.MSG_VALUE = 0x01;
 MixxxCollab.MSG_SNAPSHOT_REQUEST = 0x02;
+MixxxCollab.MSG_POSITION = 0x03;  // from Mixxx: idx = deck, value = playposition
+MixxxCollab.MSG_SEEK = 0x04;      // to Mixxx: idx = deck, value = playposition
+MixxxCollab.MSG_TRIM = 0x05;      // to Mixxx: idx = deck, value = relative speed trim
 MixxxCollab.EPSILON = 1e-4;
+
+// Deck sync: each deck's playposition is reported while it plays, and the
+// follower's bridge answers with seeks and small speed trims to stay on the
+// leader's playhead. Keep in sync with DECKS in collab_bridge.py.
+MixxxCollab.decks = ["[Channel1]", "[Channel2]"];
+MixxxCollab.POSITION_INTERVAL_MS = 200;
+MixxxCollab.TRIM_ACTIVE_MS = 3000;
+MixxxCollab.lastPositionSent = [0, 0];
+MixxxCollab.trimRatio = [1, 1];   // speed factor currently applied on top of the rate
+MixxxCollab.lastTrim = [0, 0];    // when the bridge last trimmed each deck
+MixxxCollab.quantizeTimer = [0, 0];  // pending "turn quantize back on" timers
 
 // ORDER MATTERS — the index is what goes over the wire.
 // Keep in sync with CONTROLS in collab_bridge.py.
@@ -92,11 +106,68 @@ MixxxCollab.decodeFloat = function(b) {
     return view.getFloat32(0, false);
 };
 
-MixxxCollab.sendValue = function(idx, value) {
-    var msg = [0xF0, MixxxCollab.SYSEX_ID, MixxxCollab.FROM_MIXXX, MixxxCollab.MSG_VALUE, idx]
+MixxxCollab.send = function(type, idx, value) {
+    var msg = [0xF0, MixxxCollab.SYSEX_ID, MixxxCollab.FROM_MIXXX, type, idx]
         .concat(MixxxCollab.encodeFloat(value))
         .concat([0xF7]);
     midi.sendSysexMsg(msg, msg.length);
+};
+
+MixxxCollab.sendValue = function(idx, value) {
+    MixxxCollab.send(MixxxCollab.MSG_VALUE, idx, value);
+};
+
+// Deck number (0-based) if control idx is a synced deck's rate, else -1.
+MixxxCollab.rateDeck = function(idx) {
+    var c = MixxxCollab.controls[idx];
+    return c[1] === "rate" ? MixxxCollab.decks.indexOf(c[0]) : -1;
+};
+
+MixxxCollab.rememberRemote = function(idx, value) {
+    if (!MixxxCollab.recentRemote[idx]) {
+        MixxxCollab.recentRemote[idx] = [];
+    }
+    MixxxCollab.recentRemote[idx].push([value, Date.now()]);
+};
+
+MixxxCollab.makePositionHandler = function(deck) {
+    var group = MixxxCollab.decks[deck];
+    return function(value) {
+        var now = Date.now();
+        if (now - MixxxCollab.lastPositionSent[deck] < MixxxCollab.POSITION_INTERVAL_MS ||
+                !engine.getValue(group, "play")) {
+            return;
+        }
+        MixxxCollab.lastPositionSent[deck] = now;
+        MixxxCollab.send(MixxxCollab.MSG_POSITION, deck, value);
+    };
+};
+
+// Seek to an exact position. With quantize on, Mixxx keeps the beat phase when
+// a playing deck seeks, so the deck lands up to half a beat from where it was
+// sent and small corrections do nothing. Turn quantize off for the seek and
+// put it back once the engine has processed it.
+MixxxCollab.seekExact = function(deck, position) {
+    var group = MixxxCollab.decks[deck];
+    if (engine.getValue(group, "quantize")) {
+        engine.setValue(group, "quantize", 0);
+        if (!MixxxCollab.quantizeTimer[deck]) {
+            MixxxCollab.quantizeTimer[deck] = engine.beginTimer(250, function() {
+                MixxxCollab.quantizeTimer[deck] = 0;
+                engine.setValue(group, "quantize", 1);
+            }, true);
+        }
+    }
+    engine.setValue(group, "playposition", position);
+};
+
+// Apply a speed trim from the bridge on top of whatever the rate is set to.
+MixxxCollab.applyTrim = function(deck, trim) {
+    var group = MixxxCollab.decks[deck];
+    var base = engine.getValue(group, "rate_ratio") / MixxxCollab.trimRatio[deck];
+    MixxxCollab.trimRatio[deck] = 1 + trim;
+    MixxxCollab.lastTrim[deck] = Date.now();
+    engine.setValue(group, "rate_ratio", base * MixxxCollab.trimRatio[deck]);
 };
 
 MixxxCollab.sendSnapshot = function() {
@@ -111,6 +182,15 @@ MixxxCollab.makeHandler = function(idx) {
         if (MixxxCollab.isRemoteEcho(idx, value)) {
             return;  // this change came from the peer; don't echo it
         }
+        var deck = MixxxCollab.rateDeck(idx);
+        if (deck >= 0 && Date.now() - MixxxCollab.lastTrim[deck] < MixxxCollab.TRIM_ACTIVE_MS) {
+            // This deck is being trimmed to follow the peer, so its rate
+            // belongs to the peer; the change we see is our own trim.
+            return;
+        }
+        if (deck >= 0) {
+            MixxxCollab.trimRatio[deck] = 1;  // a local pitch change overwrote any old trim
+        }
         MixxxCollab.sendValue(idx, value);
     };
 };
@@ -123,6 +203,13 @@ MixxxCollab.init = function(id, debugging) {
             MixxxCollab.connections.push(conn);
         } else {
             print("MixxxCollab: could not connect " + c[0] + "," + c[1]);
+        }
+    }
+    for (var d = 0; d < MixxxCollab.decks.length; d++) {
+        var pos = engine.makeConnection(MixxxCollab.decks[d], "playposition",
+            MixxxCollab.makePositionHandler(d));
+        if (pos) {
+            MixxxCollab.connections.push(pos);
         }
     }
     print("MixxxCollab: bridge mapping ready (" + MixxxCollab.controls.length + " controls)");
@@ -149,22 +236,41 @@ MixxxCollab.incomingData = function(data, length) {
         MixxxCollab.sendSnapshot();
         return;
     }
-    if (type !== MixxxCollab.MSG_VALUE || length < 11) {
+    if (length < 11) {
+        return;
+    }
+    var idx = data[4];
+    var value = MixxxCollab.decodeFloat([data[5], data[6], data[7], data[8], data[9]]);
+
+    if (type === MixxxCollab.MSG_SEEK || type === MixxxCollab.MSG_TRIM) {
+        if (idx >= MixxxCollab.decks.length) {
+            return;
+        }
+        if (type === MixxxCollab.MSG_SEEK) {
+            MixxxCollab.seekExact(idx, value);
+        } else {
+            MixxxCollab.applyTrim(idx, value);
+        }
+        return;
+    }
+    if (type !== MixxxCollab.MSG_VALUE) {
         return;
     }
 
-    var idx = data[4];
     var c = MixxxCollab.controls[idx];
     if (!c) {
         return;
     }
-    var value = MixxxCollab.decodeFloat([data[5], data[6], data[7], data[8], data[9]]);
-    if (Math.abs(engine.getValue(c[0], c[1]) - value) < MixxxCollab.EPSILON) {
+    var deck = MixxxCollab.rateDeck(idx);
+    var trimmed = deck >= 0 && MixxxCollab.trimRatio[deck] !== 1;
+    if (!trimmed && Math.abs(engine.getValue(c[0], c[1]) - value) < MixxxCollab.EPSILON) {
         return;  // already there
     }
-    if (!MixxxCollab.recentRemote[idx]) {
-        MixxxCollab.recentRemote[idx] = [];
-    }
-    MixxxCollab.recentRemote[idx].push([value, Date.now()]);
+    MixxxCollab.rememberRemote(idx, value);
     engine.setValue(c[0], c[1], value);
+    if (trimmed) {
+        // The peer's rate replaced ours, trim included; put the trim back.
+        engine.setValue(c[0], "rate_ratio",
+            engine.getValue(c[0], "rate_ratio") * MixxxCollab.trimRatio[deck]);
+    }
 };
