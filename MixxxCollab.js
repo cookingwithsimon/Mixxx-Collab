@@ -32,6 +32,7 @@ MixxxCollab.MSG_LOOP = 0x07;      // from Mixxx: idx = deck, value = loop length
 MixxxCollab.MSG_LOADED = 0x08;    // from Mixxx: the file now loaded on a deck
 MixxxCollab.MSG_LOAD = 0x09;      // to Mixxx: load this file on a deck
 MixxxCollab.MSG_REPORT_TRACKS = 0x0A;  // to Mixxx: report every deck's file again
+MixxxCollab.MSG_FOLLOW = 0x0B;    // to Mixxx: idx = deck, value = 1 if we follow the other side's playhead
 MixxxCollab.PATH_CHUNK = 96;      // path bytes per SysEx message (loopMIDI caps SysEx at 256 bytes)
 MixxxCollab.EPSILON = 1e-4;
 
@@ -47,9 +48,13 @@ MixxxCollab.trimRatio = [];       // speed factor currently applied on top of th
 MixxxCollab.lastTrim = [];        // when the bridge last trimmed each deck
 MixxxCollab.quantizeTimer = [];   // pending "turn quantize back on" timers
 MixxxCollab.lastLocation = [];    // file last reported as loaded, per deck
+MixxxCollab.following = [];       // decks whose playhead follows the other machine
+MixxxCollab.savedQuantize = [];   // the DJ's quantize setting, to restore when we stop following
 MixxxCollab.loadChunks = [];      // path chunks arriving from the bridge, per deck
 for (var d = 0; d < MixxxCollab.decks.length; d++) {
     MixxxCollab.lastLocation.push(null);
+    MixxxCollab.following.push(false);
+    MixxxCollab.savedQuantize.push(null);
     MixxxCollab.loadChunks.push({});
     MixxxCollab.lastPositionSent.push(0);
     MixxxCollab.trimRatio.push(1);
@@ -224,6 +229,25 @@ MixxxCollab.seekExact = function(deck, position) {
         }
     }
     engine.setValue(group, "playposition", position);
+};
+
+// On a deck that follows the other machine, Mixxx's own beat snapping
+// (quantize) only fights the sync: the owner's deck already snapped, and its
+// playhead is what we copy. Snapping here too made followed decks bounce.
+// Keep it off while following and put the DJ's setting back afterwards.
+MixxxCollab.setFollowing = function(deck, on) {
+    if (MixxxCollab.following[deck] === on) {
+        return;
+    }
+    MixxxCollab.following[deck] = on;
+    var group = MixxxCollab.decks[deck];
+    if (on) {
+        MixxxCollab.savedQuantize[deck] = engine.getValue(group, "quantize");
+        engine.setValue(group, "quantize", 0);
+    } else if (MixxxCollab.savedQuantize[deck] !== null) {
+        engine.setValue(group, "quantize", MixxxCollab.savedQuantize[deck]);
+        MixxxCollab.savedQuantize[deck] = null;
+    }
 };
 
 // Apply a speed trim from the bridge on top of whatever the rate is set to.
@@ -451,11 +475,14 @@ MixxxCollab.incomingData = function(data, length) {
     var idx = data[4];
     var value = MixxxCollab.decodeFloat([data[5], data[6], data[7], data[8], data[9]]);
 
-    if (type === MixxxCollab.MSG_SEEK || type === MixxxCollab.MSG_TRIM) {
+    if (type === MixxxCollab.MSG_SEEK || type === MixxxCollab.MSG_TRIM ||
+            type === MixxxCollab.MSG_FOLLOW) {
         if (idx >= MixxxCollab.decks.length) {
             return;
         }
-        if (type === MixxxCollab.MSG_SEEK) {
+        if (type === MixxxCollab.MSG_FOLLOW) {
+            MixxxCollab.setFollowing(idx, value > 0.5);
+        } else if (type === MixxxCollab.MSG_SEEK) {
             MixxxCollab.seekExact(idx, value);
         } else {
             MixxxCollab.applyTrim(idx, value);

@@ -72,6 +72,7 @@ MSG_LOOP = 0x07       # from Mixxx: idx = deck, value = active loop length as a 
 MSG_LOADED = 0x08     # from Mixxx: the file now loaded on a deck (needs the MixxxCollab Mixxx build)
 MSG_LOAD = 0x09       # to Mixxx:   load this file on a deck
 MSG_REPORT_TRACKS = 0x0A  # to Mixxx: report every deck's loaded file again
+MSG_FOLLOW = 0x0B     # to Mixxx:   idx = deck, value = 1 if this side follows the other's playhead
 PATH_CHUNK = 96       # path bytes per SysEx message
 # Control idx of each deck's play button, in deck order.
 DECK_PLAY_IDX = [CONTROLS.index((group, "play")) for group in DECKS]
@@ -609,6 +610,7 @@ class Bridge:
             self.midi_in = mido.open_input(in_name, callback=self.on_midi)
         print(f"MIDI: in='{in_name}' out='{out_name}'")
         self.send_to_mixxx([SYSEX_ID, TO_MIXXX, MSG_REPORT_TRACKS])
+        self.send_following()
         print(f"UDP:  listening on {args.listen}, peer {self.peer_addr[0]}:{self.peer_addr[1]}")
         print(f"Role: {'LEADER' if self.leader else 'follower'}  session={self.session:08x}  "
               f"owns decks {', '.join(str(d + 1) for d in sorted(self.owned))}")
@@ -798,6 +800,14 @@ class Bridge:
         with self.midi_lock:
             self.midi_out.send(mido.Message("sysex", data=data))
 
+    def send_following(self):
+        """Tell the mapping which decks follow the other side, so it can keep
+        Mixxx's own beat snapping (quantize) off on them. Repeated every
+        second, in case Mixxx was restarted."""
+        for deck in range(len(DECKS)):
+            self.send_to_mixxx([SYSEX_ID, TO_MIXXX, MSG_FOLLOW, deck]
+                               + encode_float(1.0 if deck in self.deck_sync else 0.0))
+
     def send_seek(self, deck, pos):
         self.send_to_mixxx([SYSEX_ID, TO_MIXXX, MSG_SEEK, deck] + encode_float(pos))
         print(f"  Deck {deck + 1}: seek to match leader")
@@ -915,6 +925,7 @@ class Bridge:
             ours = [idx for idx, entry in self.state.items() if entry["local"] is not None]
         for idx in ours:
             self.send_value(idx)
+        self.send_following()
         with self.state_lock:
             our_loads = [deck for deck, entry in self.loads.items() if entry["local"] is not None]
         for deck in our_loads:
