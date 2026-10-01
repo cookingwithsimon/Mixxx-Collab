@@ -14,6 +14,7 @@ the leader pushes its full mixer state so both sides start out matching.
 """
 
 import argparse
+import os
 import collections
 import heapq
 import itertools
@@ -65,6 +66,12 @@ MSG_SEEK = 0x04       # to Mixxx:   idx = deck, value = playposition to jump to
 MSG_TRIM = 0x05       # to Mixxx:   idx = deck, value = relative speed trim
 MSG_SPEED = 0x06      # from Mixxx: idx = deck, value = playback speed in track fractions per second
 MSG_LOOP = 0x07       # from Mixxx: idx = deck, value = active loop length as a track fraction, 0 if none
+# Track paths travel in chunks: F0 7D <dir> <type> <deck> <chunk> <count> <nibbles...> F7,
+# each byte of the UTF-8 path as two 4-bit nibbles (SysEx bytes must stay under 0x80,
+# and loopMIDI caps a SysEx message at 256 bytes).
+MSG_LOADED = 0x08     # from Mixxx: the file now loaded on a deck (needs the MixxxCollab Mixxx build)
+MSG_LOAD = 0x09       # to Mixxx:   load this file on a deck
+PATH_CHUNK = 96       # path bytes per SysEx message
 # Control idx of each deck's play button, in deck order.
 DECK_PLAY_IDX = [CONTROLS.index((group, "play")) for group in DECKS]
 
@@ -77,6 +84,9 @@ VALUE_FMT = "!BIBfd"
 NET_POSITION = 5  # !BIBddBd type, session, deck, session time, playposition, playing, speed
 POSITION_FMT = "!BIBddBd"
 NET_HELLO = 2   # !BI     type, session
+NET_LOAD = 6     # !BIBd + UTF-8 path: type, session, deck, session time of the load,
+                 # path relative to the shared music folder, with / separators
+LOAD_FMT = "!BIBd"
 NET_PING = 3    # !BId    type, session, t0 (sender's local clock)
 NET_PONG = 4    # !BIddd  type, session, echoed t0, t1 (received), t2 (replied)
 PING_FMT = "!BId"
@@ -502,6 +512,15 @@ class DeckSync:
                 self.trim(self.deck, trim)
 
 
+def chunk_path(kind, deck, path):
+    """SysEx data messages carrying path to/from Mixxx, nibble-encoded in chunks."""
+    raw = path.encode("utf-8")
+    chunks = [raw[i:i + PATH_CHUNK] for i in range(0, len(raw), PATH_CHUNK)] or [b""]
+    return [[SYSEX_ID, TO_MIXXX, kind, deck, n, len(chunks)]
+            + [nib for byte in chunk for nib in (byte >> 4, byte & 0x0F)]
+            for n, chunk in enumerate(chunks)]
+
+
 class Bridge:
     def __init__(self, args):
         self.args = args
@@ -540,6 +559,12 @@ class Bridge:
         self.session = random.getrandbits(32)
         self.midi_lock = threading.Lock()
         self.impair = Impairment(args.impair) if args.impair else None
+        # Track loading: paths travel relative to each machine's copy of the
+        # shared music folder, so the same file can sit at different places.
+        self.library = os.path.normpath(args.library) if args.library else None
+        self.loads = {}                # deck -> {"path", "ts", "local"}, newest wins as with values
+        self.deck_track = {}           # deck -> relative path our Mixxx has loaded (None: outside library)
+        self.path_chunks = {}          # deck -> {chunk: bytes} while a path arrives from Mixxx
 
         host, port = args.peer.rsplit(":", 1)
         self.peer_addr = (socket.gethostbyname(host), int(port))
@@ -583,6 +608,9 @@ class Bridge:
         d = msg.data  # excludes F0 / F7
         if len(d) < 3 or d[0] != SYSEX_ID or d[1] != FROM_MIXXX:
             return  # not ours, or our own TO_MIXXX message looping back
+        if d[2] == MSG_LOADED and len(d) >= 6:
+            self.on_loaded_chunk(d[3], d[4], d[5], bytes(d[6:]))
+            return
         if len(d) < 9:
             return
         idx = d[3]
@@ -642,12 +670,104 @@ class Bridge:
         self.last_position[deck] = packet
         self.send(packet)
         sync = self.deck_sync.get(deck)
-        if sync and self.clock.synced:
+        if sync and self.clock.synced and self.same_track(deck):
             sync.own_report(t, pos, playing)
             if self.sync_log and sync.last_error is not None:
                 self.sync_log.write(f"{t:.4f},{deck + 1},{sync.last_error * 1000:.3f},"
                                     f"{sync.current_trim * 1e6:.1f},{sync.seeks},{sync.seek_lead * 1000:.1f}\n")
                 self.sync_log.flush()
+
+    # ---- track loading ----
+    def to_relative(self, location):
+        """Path of a local file relative to the shared folder, or None if outside it."""
+        if not self.library or not location:
+            return None
+        full = os.path.normpath(location)
+        try:
+            rel = os.path.relpath(full, self.library)
+        except ValueError:          # different drive on Windows
+            return None
+        if rel.startswith(".."):
+            return None
+        return rel.replace(os.sep, "/")
+
+    def on_loaded_chunk(self, deck, n, count, nibbles):
+        if deck >= len(DECKS):
+            return
+        parts = self.path_chunks.setdefault(deck, {})
+        if n == 0:
+            parts.clear()
+        parts[n] = bytes((nibbles[i] << 4) | nibbles[i + 1] for i in range(0, len(nibbles) - 1, 2))
+        if len(parts) < count:
+            return
+        location = b"".join(parts[i] for i in range(count)).decode("utf-8", "replace")
+        parts.clear()
+        self.on_track_loaded(deck, location)
+
+    def on_track_loaded(self, deck, location):
+        """Our Mixxx loaded location on deck (by a local action or because we asked it to)."""
+        rel = self.to_relative(location)
+        self.deck_track[deck] = rel
+        if not location:
+            return
+        if rel is None:
+            print(f"Deck {deck + 1}: loaded a track outside the shared folder; "
+                  f"the other side can't load it: {location}")
+            return
+        with self.state_lock:
+            entry = self.loads.get(deck)
+            if entry is not None and entry["path"] == rel:
+                return      # the load we asked for (or one we already sent)
+            if self.connected():
+                self.loads[deck] = {"path": rel, "ts": None, "local": self.clock.local()}
+            else:
+                # Already loaded before the session started: an old change,
+                # so any real load wins, and at connect the leader's tracks
+                # win over the follower's, as with the rest of the state.
+                self.loads[deck] = {"path": rel, "ts": 1.0 if self.leader else 0.0,
+                                    "local": self.clock.local()}
+        print(f"Deck {deck + 1}: loaded {rel}")
+        self.send_load(deck)
+
+    def send_load(self, deck):
+        if not (self.leader or self.clock.synced):
+            return
+        with self.state_lock:
+            entry = self.loads.get(deck)
+            if entry is None or entry["local"] is None:
+                return
+            entry["ts"] = self.entry_time(entry)
+            packet = struct.pack(LOAD_FMT, NET_LOAD, self.session, deck, entry["ts"]) + entry["path"].encode("utf-8")
+        self.send(packet)
+
+    def on_remote_load(self, deck, ts, rel):
+        if deck >= len(DECKS):
+            return
+        with self.state_lock:
+            entry = self.loads.get(deck)
+            if entry is not None and ts <= self.entry_time(entry):
+                return
+            self.loads[deck] = {"path": rel, "ts": ts, "local": None}
+        if not self.library:
+            print(f"Deck {deck + 1}: other side loaded {rel}, but no --library is set here")
+            return
+        location = os.path.join(self.library, *rel.split("/"))
+        if not os.path.exists(location):
+            print(f"Deck {deck + 1}: other side loaded {rel}, MISSING here ({location})")
+            return
+        if self.deck_track.get(deck) == rel:
+            return
+        print(f"Deck {deck + 1}: loading {rel} to match the other side")
+        for data in chunk_path(MSG_LOAD, deck, location):
+            self.send_to_mixxx(data)
+
+    def same_track(self, deck):
+        """False when we know the two decks hold different tracks (don't sync them)."""
+        mine = self.deck_track.get(deck, "unknown")
+        agreed = self.loads.get(deck)
+        if mine == "unknown" or agreed is None:
+            return True     # stock Mixxx can't tell us; assume the DJs loaded the same file
+        return mine == agreed["path"]
 
     # ---- network -> Mixxx ----
     def send_to_mixxx(self, data):
@@ -682,7 +802,7 @@ class Bridge:
     def recv_loop(self):
         while True:
             try:
-                data, addr = self.sock.recvfrom(64)
+                data, addr = self.sock.recvfrom(2048)
             except ConnectionResetError:
                 continue  # Windows raises this for ICMP port-unreachable; ignore
             if not data or addr != self.peer_addr:
@@ -723,8 +843,12 @@ class Bridge:
         elif kind == NET_POSITION and len(data) == struct.calcsize(POSITION_FMT):
             _, session, deck, t, pos, playing, speed = struct.unpack(POSITION_FMT, data)
             sync = self.deck_sync.get(deck)
-            if session == self.peer_session and sync and self.clock.synced:
+            if session == self.peer_session and sync and self.clock.synced and self.same_track(deck):
                 sync.leader_report(t, pos, bool(playing), speed, self.clock.now())
+        elif kind == NET_LOAD and len(data) > struct.calcsize(LOAD_FMT):
+            _, session, deck, ts = struct.unpack_from(LOAD_FMT, data)
+            self.note_peer(session)
+            self.on_remote_load(deck, ts, data[struct.calcsize(LOAD_FMT):].decode("utf-8", "replace"))
         elif kind == NET_HELLO and len(data) == struct.calcsize("!BI"):
             _, session = struct.unpack("!BI", data)
             self.note_peer(session)
@@ -767,6 +891,10 @@ class Bridge:
             ours = [idx for idx, entry in self.state.items() if entry["local"] is not None]
         for idx in ours:
             self.send_value(idx)
+        with self.state_lock:
+            our_loads = [deck for deck, entry in self.loads.items() if entry["local"] is not None]
+        for deck in our_loads:
+            self.send_load(deck)
         for deck, packet in enumerate(self.last_position):
             if packet is not None and not self.playing.get(DECK_PLAY_IDX[deck]):
                 self.send(packet)
@@ -854,6 +982,8 @@ def main():
     p.add_argument("--leader", action="store_true", help="this side's state wins on connect")
     p.add_argument("--verbose", "-v", action="store_true", help="log every control change")
     p.add_argument("--list-ports", action="store_true", help="list MIDI ports and exit")
+    p.add_argument("--library", metavar="FOLDER",
+                   help="this machine's path to the shared music folder; enables track loading")
     p.add_argument("--own-decks", metavar="LIST",
                    help="decks whose playhead this side owns, e.g. 1,2 (default: leader 1,2, follower 3,4)")
     p.add_argument("--no-deck-sync", action="store_true",

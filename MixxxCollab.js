@@ -26,6 +26,12 @@ MixxxCollab.MSG_SEEK = 0x04;      // to Mixxx: idx = deck, value = playposition
 MixxxCollab.MSG_TRIM = 0x05;      // to Mixxx: idx = deck, value = relative speed trim
 MixxxCollab.MSG_SPEED = 0x06;     // from Mixxx: idx = deck, value = track fractions per second
 MixxxCollab.MSG_LOOP = 0x07;      // from Mixxx: idx = deck, value = loop length as a track fraction
+// Track paths, in chunks: <type> <deck> <chunk> <count> <nibbles...>, each
+// UTF-8 byte as two 4-bit nibbles. Needs the MixxxCollab build of Mixxx,
+// which adds engine.getTrackLocation() and engine.loadTrackFromLocation().
+MixxxCollab.MSG_LOADED = 0x08;    // from Mixxx: the file now loaded on a deck
+MixxxCollab.MSG_LOAD = 0x09;      // to Mixxx: load this file on a deck
+MixxxCollab.PATH_CHUNK = 96;      // path bytes per SysEx message (loopMIDI caps SysEx at 256 bytes)
 MixxxCollab.EPSILON = 1e-4;
 
 // Deck sync: each deck's playposition is reported, and for decks the other
@@ -39,7 +45,11 @@ MixxxCollab.lastPositionSent = [];
 MixxxCollab.trimRatio = [];       // speed factor currently applied on top of the rate
 MixxxCollab.lastTrim = [];        // when the bridge last trimmed each deck
 MixxxCollab.quantizeTimer = [];   // pending "turn quantize back on" timers
+MixxxCollab.lastLocation = [];    // file last reported as loaded, per deck
+MixxxCollab.loadChunks = [];      // path chunks arriving from the bridge, per deck
 for (var d = 0; d < MixxxCollab.decks.length; d++) {
+    MixxxCollab.lastLocation.push(null);
+    MixxxCollab.loadChunks.push({});
     MixxxCollab.lastPositionSent.push(0);
     MixxxCollab.trimRatio.push(1);
     MixxxCollab.lastTrim.push(0);
@@ -280,6 +290,96 @@ MixxxCollab.sendLocalChange = function(idx, value) {
     MixxxCollab.sendValue(idx, value);
 };
 
+// ---- Track loading (MixxxCollab build of Mixxx only) ----
+
+MixxxCollab.canLoad = function() {
+    return typeof engine.getTrackLocation === "function" &&
+        typeof engine.loadTrackFromLocation === "function";
+};
+
+MixxxCollab.toUtf8 = function(text) {
+    var raw = unescape(encodeURIComponent(text));
+    var bytes = [];
+    for (var i = 0; i < raw.length; i++) {
+        bytes.push(raw.charCodeAt(i));
+    }
+    return bytes;
+};
+
+MixxxCollab.fromUtf8 = function(bytes) {
+    var raw = "";
+    for (var i = 0; i < bytes.length; i++) {
+        raw += String.fromCharCode(bytes[i]);
+    }
+    return decodeURIComponent(escape(raw));
+};
+
+MixxxCollab.sendPath = function(type, deck, path) {
+    var bytes = MixxxCollab.toUtf8(path);
+    var count = Math.max(1, Math.ceil(bytes.length / MixxxCollab.PATH_CHUNK));
+    for (var n = 0; n < count; n++) {
+        var msg = [0xF0, MixxxCollab.SYSEX_ID, MixxxCollab.FROM_MIXXX, type, deck, n, count];
+        bytes.slice(n * MixxxCollab.PATH_CHUNK, (n + 1) * MixxxCollab.PATH_CHUNK).forEach(function(b) {
+            msg.push(b >> 4, b & 0x0F);
+        });
+        msg.push(0xF7);
+        midi.sendSysexMsg(msg, msg.length);
+    }
+};
+
+// Tell the bridge which file a deck has, whenever it changes. The deck's
+// controls change before Mixxx records which file is loaded, so a load shows
+// up as an empty location at first: check again a few times until it's there.
+MixxxCollab.reportTrack = function(deck, attempt) {
+    if (!MixxxCollab.canLoad()) {
+        return;
+    }
+    attempt = attempt || 0;
+    var group = MixxxCollab.decks[deck];
+    var location = engine.getTrackLocation(group);
+    if (!location && engine.getValue(group, "track_loaded") && attempt < 20) {
+        engine.beginTimer(100, function() {
+            MixxxCollab.reportTrack(deck, attempt + 1);
+        }, true);
+        return;
+    }
+    if (location === MixxxCollab.lastLocation[deck]) {
+        return;
+    }
+    MixxxCollab.lastLocation[deck] = location;
+    MixxxCollab.sendPath(MixxxCollab.MSG_LOADED, deck, location);
+};
+
+// A chunk of a path the bridge wants loaded; load it once complete.
+MixxxCollab.loadChunk = function(data, length) {
+    var deck = data[4], n = data[5], count = data[6];
+    if (deck >= MixxxCollab.decks.length || !count) {
+        return;
+    }
+    var chunks = MixxxCollab.loadChunks[deck];
+    if (n === 0) {
+        MixxxCollab.loadChunks[deck] = chunks = {};
+    }
+    var bytes = [];
+    for (var i = 7; i + 1 < length - 1; i += 2) {
+        bytes.push((data[i] << 4) | data[i + 1]);
+    }
+    chunks[n] = bytes;
+    var all = [];
+    for (var c = 0; c < count; c++) {
+        if (!chunks[c]) {
+            return;  // still waiting for some
+        }
+        all = all.concat(chunks[c]);
+    }
+    MixxxCollab.loadChunks[deck] = {};
+    if (!MixxxCollab.canLoad()) {
+        print("MixxxCollab: can't load tracks here; this needs the MixxxCollab build of Mixxx");
+        return;
+    }
+    engine.loadTrackFromLocation(MixxxCollab.decks[deck], MixxxCollab.fromUtf8(all), false);
+};
+
 MixxxCollab.init = function(id, debugging) {
     for (var i = 0; i < MixxxCollab.controls.length; i++) {
         var c = MixxxCollab.controls[i];
@@ -290,12 +390,23 @@ MixxxCollab.init = function(id, debugging) {
             print("MixxxCollab: could not connect " + c[0] + "," + c[1]);
         }
     }
-    for (var d = 0; d < MixxxCollab.decks.length; d++) {
-        var pos = engine.makeConnection(MixxxCollab.decks[d], "playposition",
-            MixxxCollab.makePositionHandler(d));
+    MixxxCollab.decks.forEach(function(group, d) {
+        var pos = engine.makeConnection(group, "playposition", MixxxCollab.makePositionHandler(d));
         if (pos) {
             MixxxCollab.connections.push(pos);
         }
+        ["track_loaded", "track_samples"].forEach(function(key) {
+            var conn = engine.makeConnection(group, key, function() {
+                MixxxCollab.reportTrack(d, 0);
+            });
+            if (conn) {
+                MixxxCollab.connections.push(conn);
+            }
+        });
+        MixxxCollab.reportTrack(d, 0);
+    });
+    if (!MixxxCollab.canLoad()) {
+        print("MixxxCollab: stock Mixxx; track loading needs the MixxxCollab build");
     }
     print("MixxxCollab: bridge mapping ready (" + MixxxCollab.controls.length + " controls)");
 };
@@ -319,6 +430,10 @@ MixxxCollab.incomingData = function(data, length) {
     var type = data[3];
     if (type === MixxxCollab.MSG_SNAPSHOT_REQUEST) {
         MixxxCollab.sendSnapshot();
+        return;
+    }
+    if (type === MixxxCollab.MSG_LOAD) {
+        MixxxCollab.loadChunk(data, length);
         return;
     }
     if (length < 11) {

@@ -57,12 +57,19 @@ Working on a LAN and over Wi-Fi between Windows and SteamOS:
   trims. In tests with a 600 ms stall every 7 s and 5% loss, steady playback
   stayed within 5 ms; starts settle within a few seconds.
 
+- Track loading (needs the MixxxCollab build of Mixxx on both machines, from
+  the `collab` branch of the Mixxx fork, which adds two scripting calls):
+  loading a file from the shared music folder on either side loads the same
+  file on the other. Start each bridge with `--library <that machine's path to
+  the shared folder>`; paths travel relative to it. Deck sync pauses on a deck
+  whose two tracks differ.
+
 Testing tools: `--impair` on the bridge degrades the network on purpose,
 `simulate.py` runs two bridges against simulated decks, and `make_click_track.py`
 plus `measure_sync.py` measure real machines through a line-in.
 
-Not yet: loading tracks (load the same file on both sides by hand), compensation
-for each machine's output latency, internet play (NAT traversal), and file sync.
+Not yet: a Linux build of the Mixxx fork (stock Mixxx still syncs everything
+except track loading), compensation for each machine's output latency, internet play (NAT traversal), and file sync.
 Effect and chain preset choices travel as positions in Mixxx's effect lists, so
 both machines need the same effects listed in the same order (the default).
 
