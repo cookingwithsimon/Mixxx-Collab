@@ -911,27 +911,37 @@ class Bridge:
                 data, addr = self.sock.recvfrom(2048)
             except ConnectionResetError:
                 continue  # Windows raises this for ICMP port-unreachable; ignore
-            if not data:
-                continue
-            if nat.is_stun(data):
+            try:
+                self.on_datagram(data, addr)
+            except Exception as e:
+                # With the port open to the internet, anything can arrive; a
+                # bad packet must never stop us receiving.
+                print(f"Ignored a malformed packet from {addr[0]}:{addr[1]} ({e.__class__.__name__})")
+
+    def on_datagram(self, data, addr):
+        """One UDP packet: STUN answers, then (signed) packets from the peer."""
+        if not data:
+            return
+        if nat.is_stun(data):
+            if addr in self.stun_txns.values():   # only answers from servers we asked
                 self.on_stun(data)
-                continue
-            if self.secret:
-                data = nat.verify(self.secret, data)
-                if data is None:
-                    continue  # not signed with our session's secret
-                if addr != self.peer_addr:
-                    print(f"Peer reached at {addr[0]}:{addr[1]}")
-                    self.peer_addr = addr
-                    self.add_candidates([addr])
-                    self.save_session()
-            elif addr != self.peer_addr:
-                continue  # only the configured peer may drive this Mixxx
-            if self.impair:
-                # Arrival time is taken when the impaired packet is delivered.
-                self.impair.schedule(lambda d=data: self.handle_packet(d, self.clock.local()))
-            else:
-                self.handle_packet(data, self.clock.local())
+            return
+        if self.secret:
+            data = nat.verify(self.secret, data)
+            if data is None:
+                return  # not signed with our session's secret
+            if addr != self.peer_addr:
+                print(f"Peer reached at {addr[0]}:{addr[1]}")
+                self.peer_addr = addr
+                self.add_candidates([addr])
+                self.save_session()
+        elif addr != self.peer_addr:
+            return  # only the configured peer may drive this Mixxx
+        if self.impair:
+            # Arrival time is taken when the impaired packet is delivered.
+            self.impair.schedule(lambda d=data: self.handle_packet(d, self.clock.local()))
+        else:
+            self.handle_packet(data, self.clock.local())
 
     def on_value(self, idx, value, ts):
         """A control value from the peer, changed at session time ts."""
@@ -1190,6 +1200,8 @@ def main():
                     print(f"No port forward: {result}. The reply code will be needed.")
             print("\n  Invite code for your partner:\n\n    " + nat.make_invite(args.secret, public, lan) + "\n")
             threading.Thread(target=wait_for_reply, args=(bridge, args.reply), daemon=True).start()
+        elif args.resume and args.leader:
+            threading.Thread(target=wait_for_reply, args=(bridge, args.reply), daemon=True).start()
         elif args.join:
             print("\n  Send this reply code back to the leader:\n\n    "
                   + nat.make_reply(args.secret, public, lan) + "\n")
@@ -1200,27 +1212,33 @@ def main():
 def wait_for_reply(bridge, code):
     """The leader learns the partner's addresses from the reply code. Often
     not needed (the partner's packets get through first), so it's optional."""
+    # Keeps listening for the whole session: a partner who moves networks
+    # (say, onto a phone hotspot) can send a fresh reply code at any time.
     path = os.path.join(os.path.dirname(SESSION_FILE), "reply.txt")
     asking = bool(sys.stdin and sys.stdin.isatty())
-    while not code:
-        if bridge.connected():
-            return
-        if os.path.exists(path):
+    while True:
+        if not code and os.path.exists(path):
             with open(path) as f:
                 code = f.read().strip()
             os.remove(path)
-        elif asking:
+        elif not code and asking and not bridge.connected():
             try:
                 code = input("  Paste the partner's reply code (or just wait if it connects): ").strip()
             except EOFError:
                 asking = False   # no keyboard (started in the background): use reply.txt
-        else:
-            time.sleep(1)
-    try:
-        bridge.add_candidates(nat.read_reply(bridge.secret, code))
-        print("Reply code accepted; reaching the partner...")
-    except ValueError as e:
-        print(f"Reply code not accepted: {e}")
+        if code:
+            try:
+                addrs, matches = nat.read_reply(bridge.secret, code)
+                bridge.add_candidates(addrs)
+                print("Reply code accepted; reaching the partner at "
+                      + ", ".join(f"{ip}:{port}" for ip, port in addrs))
+                if not matches:
+                    print("  (its check characters don't match this session's invite; "
+                          "trying the addresses anyway)")
+            except ValueError as e:
+                print(f"Reply code not accepted: {e}")
+            code = None
+        time.sleep(1)
 
 
 if __name__ == "__main__":

@@ -137,7 +137,10 @@ def make_reply(secret, public, lan):
 
 
 def read_reply(secret, code):
-    """[candidate addresses] from a reply code made for this session's invite."""
+    """([candidate addresses], matches) from a reply code. matches is False when
+    its check doesn't fit this session's invite: usually a typo in the last few
+    characters, so the addresses are still worth trying (packets are signed
+    anyway, so a wrong partner can't get in)."""
     code = code.strip()
     if not code.startswith(REPLY_PREFIX):
         raise ValueError("not a MixxxCollab reply code (they start with mxr1-)")
@@ -145,9 +148,8 @@ def read_reply(secret, code):
     if len(raw) != 18:
         raise ValueError("reply code is the wrong length; was it copied whole?")
     body, tag = raw[:12], raw[12:]
-    if not hmac.compare_digest(tag, hmac.new(secret, body, hashlib.sha256).digest()[:6]):
-        raise ValueError("that reply code belongs to a different invite")
-    return [a for a in (_unpack_addr(body[:6]), _unpack_addr(body[6:12])) if a]
+    matches = hmac.compare_digest(tag, hmac.new(secret, body, hashlib.sha256).digest()[:6])
+    return [a for a in (_unpack_addr(body[:6]), _unpack_addr(body[6:12])) if a], matches
 
 
 # ---- UPnP ----
